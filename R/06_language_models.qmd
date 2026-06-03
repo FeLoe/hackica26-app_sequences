@@ -1,0 +1,543 @@
+---
+title: "Language-Based Models of App Usage"
+subtitle: "Method 6 — Activity2Vec / Doc2Vec · ICA 2026 Hackathon"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(word2vec)
+library(doc2vec)
+library(Rtsne)
+library(umap)
+library(cluster)
+library(scales)
+library(patchwork)
+library(ggrepel)
+library(RColorBrewer)
+```
+
+## Conceptual framing
+
+The language-model approach treats app sequences as *text*: each app use is
+a "word", each person's full history is a "document". Trained on the corpus
+of all sequences, a Word2Vec model learns a **dense embedding** for each app
+such that apps that appear in similar sequential contexts end up close in
+embedding space.
+
+The reference study (Fan et al., 2026) used `gensim`'s Word2Vec with rich
+tokens combining platform + interaction content + activity type. Because our
+data contains only `app_name` and `app_category` (no content), we enrich
+the token with **time-of-day context** — "Instagram\_morning" vs.
+"Instagram\_evening" — to give the model more signal.
+
+Two models:
+
+1. **Activity2Vec** (Word2Vec on tokens): learns which apps are
+   contextually similar — i.e., tend to appear in similar sequential
+   neighbourhoods across users.
+2. **Person2Vec** (Doc2Vec on full sequences): produces a single embedding
+   per person, enabling person-level clustering and comparison.
+
+---
+
+## Data
+
+```{r load-data}
+# --- Real data (uncomment when available) ---
+# app_categories <- read_csv("data/raw/app_categories.csv")
+# df_raw <- read_csv(
+#   "data/raw/uni_mainz_app_session.csv",
+#   col_types = cols(
+#     participant_code = col_character(),
+#     start_time       = col_datetime(),
+#     Duration         = col_double(),
+#     package_name     = col_character(),
+#     app_name         = col_character(),
+#     .default         = col_skip()
+#   )
+# ) |>
+#   left_join(app_categories, by = "package_name") |>
+#   arrange(participant_code, start_time)
+
+# --- SYNTHETIC SAMPLE ---
+set.seed(42)
+pkg_to_app <- c(
+  "com.instagram.android" = "Instagram", "com.whatsapp" = "WhatsApp",
+  "com.zhiliaoapp.musically" = "TikTok", "com.google.android.youtube" = "YouTube",
+  "com.android.chrome" = "Chrome", "com.google.android.apps.maps" = "Maps",
+  "com.google.android.calculator" = "Rechner", "com.google.android.gm" = "Gmail",
+  "com.facebook.orca" = "Messenger", "com.spotify.music" = "Spotify"
+)
+pkg_to_cat <- c(
+  "com.instagram.android" = "social network", "com.whatsapp" = "communication",
+  "com.zhiliaoapp.musically" = "social network", "com.google.android.youtube" = "social network",
+  "com.android.chrome" = "tools", "com.google.android.apps.maps" = "tools",
+  "com.google.android.calculator" = "tools", "com.google.android.gm" = "communication",
+  "com.facebook.orca" = "communication", "com.spotify.music" = "entertainment"
+)
+pkg_names <- names(pkg_to_app); pkg_probs <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
+
+df_raw <- map2_dfr(
+  paste0("P", sprintf("%03d", 1:200)),
+  sample(100:600, 200, replace = TRUE),
+  function(pid, n) {
+    starts <- as.POSIXct("2024-04-01 08:00:00") +
+      cumsum(c(0, sample(30:3600, n - 1, replace = TRUE)))
+    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
+    tibble(
+      participant_code = pid,
+      package_name = pkgs, app_name = pkg_to_app[pkgs],
+      app_category = pkg_to_cat[pkgs],
+      start_time = starts,
+      Duration = sample(10:900, n, replace = TRUE) + runif(n)
+    )
+  }
+) |> arrange(participant_code, start_time)
+# --- end synthetic sample ---
+```
+
+---
+
+## Data preparation
+
+### Merge consecutive same-app episodes
+
+```{r merge}
+gap_threshold <- 10 * 60
+
+merge_consecutive <- function(d, gap_sec) {
+  d <- arrange(d, start_time); out <- list(); cur <- d[1, ]
+  for (i in seq_len(nrow(d))[-1]) {
+    row <- d[i, ]
+    gap <- as.numeric(row$start_time - (cur$start_time + cur$Duration), units = "secs")
+    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
+      cur$Duration <- cur$Duration + row$Duration
+    } else { out <- c(out, list(cur)); cur <- row }
+  }
+  bind_rows(c(out, list(cur)))
+}
+
+df_merged <- df_raw |>
+  filter(Duration > 0) |>
+  group_by(participant_code) |>
+  group_modify(~ merge_consecutive(.x, gap_threshold)) |>
+  ungroup()
+```
+
+### Create enriched tokens
+
+Because our app vocabulary is small (~10–50 apps), raw app names give
+Word2Vec little contextual variation. We enrich each token with a time-of-day
+label, producing tokens like `Instagram_evening` or `YouTube_afternoon`.
+
+```{r tokens}
+df_tokens <- df_merged |>
+  mutate(
+    hour = as.integer(format(start_time, "%H")),
+    time_of_day = case_when(
+      hour >= 6  & hour < 12 ~ "morning",
+      hour >= 12 & hour < 17 ~ "afternoon",
+      hour >= 17 & hour < 22 ~ "evening",
+      TRUE                   ~ "night"
+    ),
+    # Base token: just the app name
+    token_app  = str_replace_all(app_name, " ", "_"),
+    # Enriched token: app + time of day (more variation for Word2Vec)
+    token_rich = paste0(token_app, "_", time_of_day)
+  )
+
+cat("Unique base tokens:    ", n_distinct(df_tokens$token_app),  "\n")
+cat("Unique enriched tokens:", n_distinct(df_tokens$token_rich), "\n")
+cat("Total events:          ", nrow(df_tokens), "\n")
+```
+
+### Build per-person sequences
+
+```{r sequences}
+# Base: one character vector of app tokens per person
+seqs_app <- df_tokens |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  summarise(tokens = list(token_app), .groups = "drop")
+
+# Enriched: app + time-of-day
+seqs_rich <- df_tokens |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  summarise(tokens = list(token_rich), .groups = "drop")
+
+# Word2Vec needs sequences as a flat character vector (sentences = " "-separated)
+corpus_app  <- sapply(seqs_app$tokens,  paste, collapse = " ")
+corpus_rich <- sapply(seqs_rich$tokens, paste, collapse = " ")
+
+cat("Corpus size (persons):", length(corpus_app), "\n")
+cat("Median sequence length:", median(lengths(seqs_app$tokens)), "tokens\n")
+```
+
+---
+
+## Activity2Vec (Word2Vec)
+
+### Train model
+
+```{r train-w2v, cache=TRUE}
+# DECISION POINT: dim, window, min_count, iter
+# - dim: 50 sufficient for small vocabularies; use 100+ for large ones
+# - window: 5 matches the reference; smaller = more local context
+# - min_count: minimum token frequency to include; 2 is reasonable for small data
+# - type: "skip-gram" (sg=1 in reference) better for rare tokens
+
+w2v_path <- "results/tables/w2v_model.bin"
+
+if (file.exists(w2v_path)) {
+  w2v <- read.word2vec(w2v_path)
+} else {
+  set.seed(42)
+  w2v <- word2vec(
+    x         = corpus_rich,
+    type      = "skip-gram",
+    dim       = 50,
+    window    = 5,
+    min_count = 2,
+    iter      = 20,
+    threads   = parallel::detectCores() - 1
+  )
+  write.word2vec(w2v, w2v_path)
+}
+
+vocab <- summary(w2v, type = "vocabulary")
+cat("Vocabulary size:", length(vocab), "\n")
+```
+
+### Explore: most similar tokens
+
+```{r similar-tokens}
+# For each app, find its nearest neighbours in embedding space
+# Expected: same-app-different-time variants should cluster together
+# Cross-app: apps used in similar behavioural contexts should be close
+
+find_similar <- function(token, model, n = 5) {
+  tryCatch(
+    predict(model, token, type = "nearest", top_n = n) |>
+      as_tibble() |>
+      mutate(query = token) |>
+      select(query, term2, similarity),
+    error = function(e) tibble(query = token, term2 = NA, similarity = NA)
+  )
+}
+
+# Query a few representative tokens
+query_tokens <- vocab[seq(1, min(6, length(vocab)))]
+map_dfr(query_tokens, find_similar, model = w2v) |>
+  knitr::kable(digits = 3, caption = "Nearest neighbours in embedding space")
+```
+
+### Extract and visualise embeddings
+
+```{r extract-embeddings}
+emb_mat <- as.matrix(w2v)
+
+# Parse token back into app name and time-of-day
+emb_df <- as_tibble(emb_mat, rownames = "token") |>
+  mutate(
+    parts       = str_split(token, "_(?=morning|afternoon|evening|night)"),
+    app_name    = map_chr(parts, 1),
+    time_of_day = map_chr(parts, \(p) if (length(p) > 1) p[2] else "unknown"),
+    app_category = pkg_to_cat[
+      names(pkg_to_app)[match(app_name, pkg_to_app)]
+    ]
+  ) |>
+  select(-parts)
+```
+
+```{r tsne-embeddings, fig.width=9, fig.height=7}
+# t-SNE dimensionality reduction (mirrors the reference visualisation)
+# Only run if enough tokens for t-SNE (needs > perplexity * 3)
+if (nrow(emb_mat) > 15) {
+  set.seed(42)
+  tsne_out <- Rtsne(
+    emb_mat,
+    dims       = 2,
+    perplexity = min(5, floor((nrow(emb_mat) - 1) / 3)),
+    verbose    = FALSE,
+    max_iter   = 1000
+  )
+
+  cat_pal <- c(
+    "social network" = "#F28E2B", "communication" = "#4E79A7",
+    "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+  )
+  tod_shapes <- c(morning = 16, afternoon = 17, evening = 15, night = 18, unknown = 3)
+
+  emb_df |>
+    mutate(tsne1 = tsne_out$Y[, 1], tsne2 = tsne_out$Y[, 2]) |>
+    ggplot(aes(tsne1, tsne2, colour = app_category, shape = time_of_day,
+               label = token)) +
+    geom_point(size = 3, alpha = 0.85) +
+    ggrepel::geom_text_repel(size = 2.8, max.overlaps = 12) +
+    scale_colour_manual(values = cat_pal, na.value = "#BAB0AC", name = "Category") +
+    scale_shape_manual(values = tod_shapes, name = "Time of day") +
+    labs(title = "Activity2Vec embedding space (t-SNE)",
+         subtitle = "Tokens closer together appear in similar sequential contexts",
+         x = "t-SNE 1", y = "t-SNE 2") +
+    theme_minimal()
+} else {
+  cat("Too few tokens for t-SNE — use PCA instead or expand vocabulary.\n")
+  # PCA fallback
+  pca_out <- prcomp(emb_mat, scale. = TRUE)
+  emb_df |>
+    mutate(pc1 = pca_out$x[, 1], pc2 = pca_out$x[, 2]) |>
+    ggplot(aes(pc1, pc2, colour = app_category, label = token)) +
+    geom_point(size = 3) +
+    ggrepel::geom_text_repel(size = 3) +
+    scale_colour_manual(values = cat_pal, na.value = "#BAB0AC") +
+    labs(title = "Activity2Vec embedding space (PCA)", x = "PC1", y = "PC2") +
+    theme_minimal()
+}
+```
+
+---
+
+## Person2Vec (Doc2Vec)
+
+Doc2Vec extends Word2Vec to produce a single embedding per person
+(treating each person's full sequence as a "document"). This enables
+**person-level** analysis: who is similar to whom, and do persons cluster
+into meaningful behavioural types?
+
+### Train model
+
+```{r train-d2v, cache=TRUE}
+d2v_path <- "results/tables/d2v_model.bin"
+
+if (file.exists(d2v_path)) {
+  d2v <- read.paragraph2vec(d2v_path)
+} else {
+  # doc2vec expects a data frame with "doc_id" and "text" columns
+  d2v_input <- tibble(
+    doc_id = seqs_rich$participant_code,
+    text   = corpus_rich
+  )
+
+  set.seed(42)
+  d2v <- paragraph2vec(
+    x         = d2v_input,
+    type      = "PV-DM",    # DM = distributed memory (default, context-aware)
+    dim       = 50,
+    window    = 5,
+    min_count = 2,
+    iter      = 20,
+    threads   = parallel::detectCores() - 1
+  )
+  write.paragraph2vec(d2v, d2v_path)
+}
+```
+
+### Person embeddings: UMAP visualisation
+
+```{r person-embeddings}
+# Extract document (person) embeddings
+person_emb <- as.matrix(d2v, which = "docs")
+rownames(person_emb) <- seqs_rich$participant_code
+
+cat("Person embedding matrix:", nrow(person_emb), "persons ×",
+    ncol(person_emb), "dimensions\n")
+```
+
+```{r umap-persons, fig.width=9, fig.height=7}
+set.seed(42)
+umap_out <- umap(person_emb, n_neighbors = min(15, nrow(person_emb) - 1))
+
+# Annotate with person-level usage stats (dominant category, sequence length)
+person_stats <- df_tokens |>
+  group_by(participant_code) |>
+  summarise(
+    seq_len       = n(),
+    dominant_cat  = names(which.max(table(app_category))),
+    pct_social    = mean(app_category == "social network"),
+    pct_comm      = mean(app_category == "communication"),
+    .groups = "drop"
+  )
+
+umap_df <- tibble(
+  participant_code = rownames(person_emb),
+  umap1 = umap_out$layout[, 1],
+  umap2 = umap_out$layout[, 2]
+) |>
+  left_join(person_stats, by = "participant_code")
+
+cat_pal <- c(
+  "social network" = "#F28E2B", "communication" = "#4E79A7",
+  "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+)
+
+umap_df |>
+  ggplot(aes(umap1, umap2, colour = dominant_cat, size = seq_len)) +
+  geom_point(alpha = 0.75) +
+  scale_colour_manual(values = cat_pal, name = "Dominant\ncategory") +
+  scale_size(range = c(1.5, 6), name = "Sequence\nlength") +
+  labs(title = "Person2Vec embedding space (UMAP)",
+       subtitle = "Each point is one participant; proximity = similar usage patterns",
+       x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal()
+```
+
+### Cluster persons in embedding space
+
+```{r person-clusters, fig.width=9, fig.height=7}
+# DECISION POINT: choose k via silhouette (same approach as Method 1)
+k_range <- 2:6
+sil_widths <- sapply(k_range, function(k) {
+  cl  <- kmeans(person_emb, centers = k, nstart = 25, iter.max = 100)
+  sil <- silhouette(cl$cluster, dist(person_emb))
+  mean(sil[, 3])
+})
+
+tibble(k = k_range, avg_silhouette = sil_widths) |>
+  ggplot(aes(k, avg_silhouette)) +
+  geom_line() + geom_point(size = 2) +
+  labs(title = "Person cluster quality by k (k-means on Doc2Vec embeddings)",
+       x = "k", y = "Average silhouette width") +
+  theme_minimal()
+```
+
+```{r cluster-umap, fig.width=9, fig.height=7}
+k_chosen <- k_range[which.max(sil_widths)]
+cat("Chosen k:", k_chosen, "\n")
+
+set.seed(42)
+km <- kmeans(person_emb, centers = k_chosen, nstart = 25)
+
+umap_df |>
+  mutate(cluster = factor(km$cluster)) |>
+  ggplot(aes(umap1, umap2, colour = cluster, size = seq_len)) +
+  geom_point(alpha = 0.8) +
+  scale_colour_brewer(palette = "Set2", name = "Cluster") +
+  scale_size(range = c(1.5, 6), name = "Sequence\nlength") +
+  labs(title = paste0("Person clusters in Doc2Vec space (k = ", k_chosen, ")"),
+       x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal()
+```
+
+```{r cluster-profiles}
+# What characterises each cluster?
+tibble(
+  participant_code = rownames(person_emb),
+  cluster = factor(km$cluster)
+) |>
+  left_join(person_stats, by = "participant_code") |>
+  group_by(cluster) |>
+  summarise(
+    n          = n(),
+    med_seq_len = median(seq_len),
+    pct_social  = round(mean(pct_social) * 100, 1),
+    pct_comm    = round(mean(pct_comm) * 100, 1),
+    dominant    = names(which.max(table(dominant_cat))),
+    .groups = "drop"
+  ) |>
+  knitr::kable(caption = "Cluster profiles")
+```
+
+---
+
+## User trajectory visualisation
+
+Plot a single person's sequence as a trajectory through the embedding
+space — each point is one app use, arrows show the temporal order.
+Mirrors the quiver-plot visualisation in the reference.
+
+```{r trajectory, fig.width=9, fig.height=7}
+# Pick one person for the trajectory (choose a person with a long sequence)
+trajectory_person <- person_stats |>
+  slice_max(seq_len, n = 1) |>
+  pull(participant_code)
+
+# Get their token sequence and look up embeddings
+traj_tokens <- df_tokens |>
+  filter(participant_code == trajectory_person) |>
+  arrange(start_time) |>
+  pull(token_rich)
+
+# Only keep tokens that are in the Word2Vec vocabulary
+in_vocab <- traj_tokens %in% rownames(emb_mat)
+traj_emb <- emb_mat[traj_tokens[in_vocab], , drop = FALSE]
+
+if (nrow(traj_emb) >= 4) {
+  # Project to 2D with PCA fitted on all embeddings
+  pca_all  <- prcomp(emb_mat, scale. = TRUE)
+  traj_2d  <- predict(pca_all, traj_emb)[, 1:2]
+  all_2d   <- pca_all$x[, 1:2]
+
+  # Background: all token embeddings
+  bg_df <- as_tibble(all_2d, rownames = "token") |>
+    mutate(
+      app_name = map_chr(str_split(token, "_(?=morning|afternoon|evening|night)"), 1),
+      app_category = pkg_to_cat[names(pkg_to_app)[match(app_name, pkg_to_app)]]
+    )
+
+  # Trajectory data frame: one row per step
+  traj_df <- as_tibble(traj_2d) |>
+    rename(x = PC1, y = PC2) |>
+    mutate(
+      t        = row_number(),
+      token    = traj_tokens[in_vocab],
+      app_name = map_chr(str_split(token, "_(?=morning|afternoon|evening|night)"), 1)
+    )
+
+  ggplot() +
+    # Background cloud of all token embeddings
+    geom_point(data = bg_df, aes(PC1, PC2, colour = app_category),
+               alpha = 0.2, size = 2) +
+    # Trajectory arrows
+    geom_segment(
+      data = traj_df |> mutate(xend = lead(x), yend = lead(y)) |> filter(!is.na(xend)),
+      aes(x = x, y = y, xend = xend, yend = yend, colour = factor(t %% 8)),
+      arrow = arrow(length = unit(2.5, "mm"), type = "closed"),
+      linewidth = 0.7, show.legend = FALSE
+    ) +
+    # Points
+    geom_point(data = traj_df, aes(x, y), colour = "black", size = 1.5) +
+    scale_colour_manual(
+      values = c("social network" = "#F28E2B", "communication" = "#4E79A7",
+                 "tools" = "#59A14F", "entertainment" = "#B07AA1",
+                 "other" = "#BAB0AC",
+                 # trajectory step colours (recycled, hidden from legend)
+                 setNames(RColorBrewer::brewer.pal(8, "PuRd"), as.character(0:7))),
+      name = "Category"
+    ) +
+    labs(
+      title = paste0("Trajectory of participant ", trajectory_person,
+                     " through activity embedding space"),
+      subtitle = "Arrows show temporal order of app uses",
+      x = "PC1", y = "PC2"
+    ) +
+    theme_minimal() +
+    guides(colour = guide_legend(override.aes = list(size = 4, alpha = 1)))
+} else {
+  cat("Not enough vocabulary overlap for trajectory plot.\n")
+}
+```
+
+---
+
+## Summary of key outputs
+
+| Output | What it shows |
+|--------|--------------|
+| Vocabulary & token counts | How rich the token space is with/without time enrichment |
+| Nearest neighbours table | Which apps appear in similar sequential contexts |
+| t-SNE embedding plot | Activity embedding space — categories should cluster |
+| UMAP person plot | Person-level behavioural space, coloured by dominant category |
+| Silhouette plot | How many person clusters are supported |
+| Cluster UMAP | Person clusters in embedding space |
+| Cluster profiles | Usage characteristics of each behavioural cluster |
+| Trajectory plot | One person's path through the embedding space over time |

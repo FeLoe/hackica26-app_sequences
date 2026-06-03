@@ -1,0 +1,501 @@
+---
+title: "Event History Analysis of App Usage"
+subtitle: "Method 2 — Survival Analysis · ICA 2026 Hackathon"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(broom)
+library(scales)
+```
+
+## Conceptual framing
+
+The core question: **how long does a person use an app before switching to
+a different one?**
+
+Each app-use episode (after merging same-app consecutive uses) is one row:
+
+- **Time** (`T`): episode duration in minutes (`Duration / 60`)
+- **Event** (`E`): did the person immediately switch to a *different* app?
+  - `E = 1` → app switch observed
+  - `E = 0` → censored (last episode per person, or last in session)
+
+The reference study (Fan et al., 2026) applied this to platform switching
+across Facebook/YouTube/TikTok/Instagram. We apply it at the **app level**
+and the coarser **app-category level**.
+
+Our data has two structural advantages the reference lacked:
+
+1. **`Duration` is pre-computed** — no need to derive from events.
+2. **`phone_session_id` is meaningful** — each value = one phone unlock.
+   We can model whether hazard of switching differs *within* vs. *across*
+   sessions, or by position within a session.
+
+---
+
+## Data
+
+**Source:** `uni_mainz_app_session.csv` (~20M rows).
+
+```{r load-data}
+# --- Real data (uncomment when available) ---
+# app_category comes from a project-provided lookup file (package_name → app_category)
+# app_categories <- read_csv("data/raw/app_categories.csv")  # provided by project
+#
+# df_raw <- read_csv(
+#   "data/raw/uni_mainz_app_session.csv",
+#   col_types = cols(
+#     participant_code = col_character(),
+#     start_time       = col_datetime(),
+#     end_time         = col_datetime(),
+#     Duration         = col_double(),
+#     phone_session_id = col_double(),
+#     app_session_id   = col_double(),
+#     package_name     = col_character(),
+#     app_name         = col_character(),
+#     .default         = col_skip()
+#   )
+# ) |>
+#   left_join(app_categories, by = "package_name") |>
+#   arrange(participant_code, start_time)
+
+# --- SYNTHETIC SAMPLE for development ---
+set.seed(42)
+
+pkg_to_app <- c(
+  "com.instagram.android"         = "Instagram",
+  "com.whatsapp"                  = "WhatsApp",
+  "com.zhiliaoapp.musically"      = "TikTok",
+  "com.google.android.youtube"    = "YouTube",
+  "com.android.chrome"            = "Chrome",
+  "com.google.android.apps.maps"  = "Maps",
+  "com.google.android.calculator" = "Rechner",
+  "com.google.android.gm"         = "Gmail",
+  "com.facebook.orca"             = "Messenger",
+  "com.spotify.music"             = "Spotify"
+)
+pkg_to_cat <- c(
+  "com.instagram.android"         = "social network",
+  "com.whatsapp"                  = "communication",
+  "com.zhiliaoapp.musically"      = "social network",
+  "com.google.android.youtube"    = "social network",
+  "com.android.chrome"            = "tools",
+  "com.google.android.apps.maps"  = "tools",
+  "com.google.android.calculator" = "tools",
+  "com.google.android.gm"         = "communication",
+  "com.facebook.orca"             = "communication",
+  "com.spotify.music"             = "entertainment"
+)
+pkg_names <- names(pkg_to_app)
+pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
+
+n_persons <- 80
+events_per <- sample(50:200, n_persons, replace = TRUE)
+
+df_raw <- map2_dfr(
+  paste0("P", sprintf("%03d", seq_len(n_persons))),
+  events_per,
+  function(pid, n) {
+    starts <- as.POSIXct("2024-04-01 08:00:00") +
+      cumsum(c(0, sample(5:1800, n - 1, replace = TRUE)))
+    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
+    durs <- sample(5:900, n, replace = TRUE) + runif(n)
+    tibble(
+      participant_code = pid,
+      package_name     = pkgs,
+      app_name         = pkg_to_app[pkgs],
+      app_category     = pkg_to_cat[pkgs],
+      start_time       = starts,
+      end_time         = starts + durs,
+      Duration         = durs,
+      phone_session_id = cumsum(c(0, as.numeric(diff(starts)) > 300)) %% 100,
+      app_session_id   = ifelse(pkgs == "com.whatsapp", NA_real_, seq_along(pkgs))
+    )
+  }
+) |> arrange(participant_code, start_time)
+# --- end synthetic sample ---
+```
+
+---
+
+## Data preparation
+
+### Step 1 — Merge consecutive same-app episodes
+
+Same 10-minute rule as Method 1. When merging, durations are summed.
+
+```{r merge-episodes}
+gap_threshold <- 10 * 60  # seconds
+
+merge_consecutive <- function(d, gap_sec) {
+  d <- arrange(d, start_time)
+  out <- list()
+  cur <- d[1, ]
+  for (i in seq_len(nrow(d))[-1]) {
+    row <- d[i, ]
+    gap <- as.numeric(row$start_time - cur$end_time, units = "secs")
+    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
+      cur$end_time <- row$end_time
+      cur$Duration <- cur$Duration + row$Duration
+    } else {
+      out <- c(out, list(cur))
+      cur <- row
+    }
+  }
+  bind_rows(c(out, list(cur)))
+}
+
+df_merged <- df_raw |>
+  filter(!is.na(participant_code), Duration > 0) |>
+  group_by(participant_code) |>
+  group_modify(~ merge_consecutive(.x, gap_threshold)) |>
+  ungroup()
+```
+
+### Step 2 — Define switch events
+
+```{r define-events}
+df_events <- df_merged |>
+  mutate(duration_min = Duration / 60) |>
+  group_by(participant_code) |>
+  mutate(
+    app_switch = as.integer(!is.na(lead(app_name)) & lead(app_name) != app_name),
+    cat_switch = as.integer(!is.na(lead(app_category)) & lead(app_category) != app_category),
+    # Last episode per person: no observed switch → right-censored
+    app_switch = replace_na(app_switch, 0),
+    cat_switch = replace_na(cat_switch, 0),
+    # Position in phone session (meaningful: phone_session_id = unlock event)
+    episode_in_session = row_number(),  # within person; refine per session below
+  ) |>
+  ungroup()
+
+# NOTE on app_session_id: gaps exist where apps are blacklisted (e.g., WhatsApp).
+# This does NOT affect the survival analysis, which is based on app_name not app_session_id.
+# But it means we may undercount true app switches where WhatsApp is involved.
+cat(sprintf(
+  "Rows with missing app_session_id (blacklisted apps): %d (%.1f%%)\n",
+  sum(is.na(df_events$app_session_id)),
+  100 * mean(is.na(df_events$app_session_id))
+))
+```
+
+### Step 3 — Descriptive overview
+
+```{r desc-summary}
+df_events |>
+  summarise(
+    n_persons    = n_distinct(participant_code),
+    n_episodes   = n(),
+    n_app_switch = sum(app_switch),
+    pct_switch   = mean(app_switch) * 100,
+    med_dur_min  = median(duration_min),
+    mean_dur_min = mean(duration_min)
+  ) |>
+  knitr::kable(digits = 1, caption = "Episode-level summary")
+```
+
+---
+
+## Session duration distributions
+
+CCDF of episode durations by app — mirrors Figure 1 of Fan et al.
+Run on **all** episodes (no sampling needed here).
+
+```{r ccdf-by-app, fig.width=9, fig.height=5}
+min_obs <- 50  # minimum episodes to draw a CCDF curve
+apps_to_plot <- df_events |> count(app_name) |> filter(n >= min_obs) |> pull(app_name)
+
+df_events |>
+  filter(app_name %in% apps_to_plot) |>
+  group_by(app_name) |>
+  arrange(duration_min, .by_group = TRUE) |>
+  mutate(ccdf = 1 - row_number() / n()) |>
+  ungroup() |>
+  ggplot(aes(duration_min, ccdf, colour = app_name)) +
+  geom_line(linewidth = 0.7) +
+  scale_x_log10(labels = label_number(suffix = " min")) +
+  scale_y_log10() +
+  labs(x = "Duration (minutes, log)", y = "CCDF",
+       title = "CCDF of app session durations", colour = "App") +
+  theme_minimal()
+```
+
+```{r ccdf-by-category, fig.width=8, fig.height=4}
+cat_pal <- c(
+  "social network" = "#F28E2B", "communication" = "#4E79A7",
+  "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+)
+
+df_events |>
+  filter(app_category %in% names(cat_pal)) |>
+  group_by(app_category) |>
+  arrange(duration_min, .by_group = TRUE) |>
+  mutate(ccdf = 1 - row_number() / n()) |>
+  ungroup() |>
+  ggplot(aes(duration_min, ccdf, colour = app_category)) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = cat_pal) +
+  scale_x_log10(labels = label_number(suffix = " min")) +
+  scale_y_log10() +
+  labs(x = "Duration (minutes, log)", y = "CCDF",
+       title = "CCDF by app category", colour = "Category") +
+  theme_minimal()
+```
+
+---
+
+## Kaplan-Meier survival analysis
+
+### Overall: time until any app switch
+
+```{r km-overall}
+km_overall <- survfit(Surv(duration_min, app_switch) ~ 1, data = df_events)
+
+ggsurvplot(
+  km_overall, data = df_events,
+  conf.int = TRUE,
+  xlab = "Duration (minutes)",
+  ylab = "P(staying on same app)",
+  title = "Overall: time until app switch",
+  ggtheme = theme_minimal()
+)
+
+surv_tab <- summary(km_overall)$table
+cat(sprintf(
+  "Median time until app switch: %.1f min (95%% CI: %.1f–%.1f)\n",
+  surv_tab["median"], surv_tab["0.95LCL"], surv_tab["0.95UCL"]
+))
+```
+
+### Stratified by app
+
+```{r km-by-app, fig.height=7}
+km_app <- survfit(
+  Surv(duration_min, app_switch) ~ app_name,
+  data = filter(df_events, app_name %in% apps_to_plot)
+)
+
+ggsurvplot(
+  km_app,
+  data         = filter(df_events, app_name %in% apps_to_plot),
+  conf.int     = FALSE,
+  pval         = TRUE, pval.method = TRUE,
+  xlab         = "Duration (minutes)",
+  ylab         = "P(staying on same app)",
+  title        = "Time until app switch, by app",
+  legend.title = "App",
+  xlim         = c(0, quantile(df_events$duration_min, 0.95)),
+  ggtheme      = theme_minimal()
+)
+```
+
+```{r km-medians}
+tidy(km_app) |>
+  filter(estimate <= 0.5) |>
+  group_by(strata) |>
+  slice_min(time, n = 1) |>
+  ungroup() |>
+  transmute(app = str_remove(strata, "app_name="), median_min = time) |>
+  arrange(median_min) |>
+  knitr::kable(caption = "Median time (min) on each app before switching")
+```
+
+### Stratified by app category
+
+```{r km-by-category}
+km_cat <- survfit(
+  Surv(duration_min, cat_switch) ~ app_category,
+  data = df_events
+)
+
+ggsurvplot(
+  km_cat, data = df_events,
+  conf.int = TRUE, pval = TRUE, pval.method = TRUE,
+  palette  = unname(cat_pal[sort(unique(df_events$app_category))]),
+  xlab = "Duration (minutes)",
+  ylab = "P(staying in same category)",
+  title = "Time until category switch, by category",
+  legend.title = "Category",
+  ggtheme = theme_minimal()
+)
+```
+
+### Log-rank tests
+
+```{r logrank}
+survdiff(Surv(duration_min, app_switch) ~ app_name,
+         data = filter(df_events, app_name %in% apps_to_plot)) |> print()
+
+survdiff(Surv(duration_min, cat_switch) ~ app_category,
+         data = df_events) |> print()
+```
+
+---
+
+## Cox Proportional Hazards model
+
+### Feature engineering
+
+```{r cox-features}
+# Compute episode position within each phone session first, then join on
+episode_pos <- df_events |>
+  group_by(participant_code, phone_session_id) |>
+  mutate(episode_in_session = row_number()) |>
+  ungroup() |>
+  select(participant_code, phone_session_id, start_time, episode_in_session)
+
+df_cox <- df_events |>
+  left_join(episode_pos,
+            by = c("participant_code", "phone_session_id", "start_time")) |>
+  mutate(
+    hour_of_day  = as.integer(format(start_time, "%H")),
+    day_of_week  = weekdays(as.Date(start_time)),
+    app_name     = relevel(factor(app_name),     ref = "Chrome"),
+    app_category = relevel(factor(app_category), ref = "tools"),
+    day_of_week  = relevel(factor(day_of_week),  ref = "Monday")
+  )
+```
+
+### Model 1 — Category only
+
+```{r cox-m1}
+m1 <- coxph(Surv(duration_min, app_switch) ~ app_category, data = df_cox)
+
+tidy(m1, exponentiate = TRUE, conf.int = TRUE) |>
+  select(term, HR = estimate, CI_low = conf.low, CI_high = conf.high, p.value) |>
+  knitr::kable(digits = 3, caption = "Cox M1: hazard ratios by app category")
+```
+
+### Model 2 — App + time of day + weekday
+
+```{r cox-m2}
+# DECISION POINT: add/remove predictors to match your RQ.
+# hour_of_day: linear here; use splines (splines::ns()) if effect is non-linear.
+m2 <- coxph(
+  Surv(duration_min, app_switch) ~ app_name + hour_of_day + day_of_week,
+  data = df_cox
+)
+
+tidy(m2, exponentiate = TRUE, conf.int = TRUE) |>
+  select(term, HR = estimate, CI_low = conf.low, CI_high = conf.high, p.value) |>
+  knitr::kable(digits = 3, caption = "Cox M2: app + time covariates")
+```
+
+```{r cox-forest, fig.height=7}
+ggforest(m2, data = df_cox, main = "Hazard ratios for app switching (Cox M2)")
+```
+
+### Model 3 — Add phone session position
+
+Session position tests whether the hazard of switching rises (or falls) as
+the person uses more apps within a single phone-unlock episode.
+
+```{r cox-m3}
+m3 <- coxph(
+  Surv(duration_min, app_switch) ~ app_name + hour_of_day + day_of_week +
+    episode_in_session,
+  data = df_cox
+)
+
+# Likelihood-ratio comparison
+anova(m2, m3) |> knitr::kable(caption = "LRT: does session position improve fit?")
+
+tidy(m3, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term == "episode_in_session") |>
+  select(term, HR = estimate, CI_low = conf.low, CI_high = conf.high, p.value) |>
+  knitr::kable(digits = 3, caption = "Session position effect on switching hazard")
+```
+
+### Proportional hazards assumption
+
+```{r ph-test}
+ph_test <- cox.zph(m2)
+print(ph_test)
+ggcoxzph(ph_test)
+```
+
+---
+
+## Phone session analysis
+
+`phone_session_id` = phone unlock episode. This lets us ask: how does
+switching behaviour differ by session characteristics?
+
+```{r session-km, fig.width=8, fig.height=4}
+df_session <- df_events |>
+  group_by(participant_code, phone_session_id) |>
+  mutate(
+    session_turn   = row_number(),
+    is_first_in_session = session_turn == 1
+  ) |>
+  ungroup()
+
+# KM: first app of a session vs. subsequent apps within same session
+km_session <- survfit(
+  Surv(duration_min, app_switch) ~ is_first_in_session,
+  data = df_session
+)
+
+ggsurvplot(
+  km_session, data = df_session,
+  conf.int = TRUE, pval = TRUE,
+  legend.labs = c("Later in session", "First app of session"),
+  xlab = "Duration (minutes)",
+  title = "First vs. later app within a phone session",
+  ggtheme = theme_minimal()
+)
+```
+
+```{r session-length-effect}
+# Does session length (how many apps total) predict per-episode switch rate?
+session_stats <- df_session |>
+  group_by(participant_code, phone_session_id) |>
+  summarise(
+    session_length = n(),
+    switch_rate    = mean(app_switch),
+    .groups = "drop"
+  )
+
+session_stats |>
+  ggplot(aes(session_length, switch_rate)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_smooth(method = "loess", se = TRUE) +
+  scale_x_log10() +
+  labs(
+    x = "Session length (apps used, log scale)",
+    y = "Within-session app switch rate",
+    title = "Does session length predict switching frequency?"
+  ) +
+  theme_minimal()
+```
+
+---
+
+## Summary of key outputs
+
+| Output              | What it shows                                           |
+|---------------------|---------------------------------------------------------|
+| CCDF by app         | How heavy-tailed session durations are per app          |
+| CCDF by category    | Duration distributions: social vs. communication vs. tools |
+| KM overall          | Median time until any app switch                        |
+| KM by app           | Which apps hold attention longest                       |
+| KM by category      | Category-level switching speed                          |
+| Log-rank test       | Whether group survival curves differ significantly      |
+| Cox M1              | Category-level hazard ratios                            |
+| Cox M2              | App-level HRs + time of day + weekday                  |
+| Cox M3              | Whether episode position within a session matters       |
+| PH assumption test  | Whether Cox model assumptions hold                      |
+| Session KM          | First app of pickup vs. later apps                      |
+| Session length plot | Whether longer pickups have higher switch rates         |

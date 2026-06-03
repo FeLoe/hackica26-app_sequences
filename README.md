@@ -1,7 +1,9 @@
 # Sequence Mining in App Data — ICA 2026 Hackathon
 
 Hackathon project for [ICA 2026](https://www.icahdq.org/page/ICA2026) in Stellenbosch.
-We analyze sequences of user activities across social media apps (Facebook, YouTube, TikTok, Instagram) using digital trace data.
+We analyze sequences of smartphone app use, treating each participant's app history
+as an ordered sequence of events and applying six computational methods to uncover
+temporal patterns.
 
 This project replicates and extends the six analytical approaches from:
 
@@ -13,46 +15,69 @@ The original code (Python) is at [YangliuF95/DTD_sequence_mining](https://github
 
 ## Research questions
 
-The core idea: represent each user's activity log as an ordered sequence of events, then ask:
+The core idea: represent each participant's app usage log as an ordered sequence of
+events, then ask:
 
-- What are typical activity patterns across and within platforms?
-- How do activities at time *t* depend on activities at *t−1*, *t−2*, …?
+- What are typical app-use patterns across the day and week?
+- How does app use at time *t* depend on what came before?
 - Are there latent user types or behavioral states?
-- Which transitions between activity types are most common?
+- Which app-to-app transitions are most common, and do apps cluster into communities?
 
 ---
 
-## Analytical approaches to replicate
+## Analytical approaches
 
-### 1. Sequence Analysis (`R/01_sequence_analysis.R`)
-**R package:** `TraMineR`
+All analyses live in `R/` as self-contained Quarto documents (`.qmd`).
+Each file includes a synthetic data generator at the top so it can be
+rendered and tested before real data arrives.
 
-Represent each user's activity history as a state sequence, compute pairwise dissimilarities (e.g., OM distance), cluster users into trajectory types, and visualize sequence index plots and mean time in each state. The reference repo already includes a `TraMineR.R` starting point.
+### 1. Sequence Analysis (`R/01_sequence_analysis.qmd`)
+**R packages:** `TraMineR`, `TraMineRextras`, `colorspace`, `cluster`
 
-### 2. Event History Analysis (`R/02_event_history.R`)
-**R packages:** `survival`, `survminer`
+Represent each participant's app history as a discrete state sequence, compute
+pairwise optimal-matching (OM) distances, cluster participants into trajectory
+types, and visualise with sequence index plots and state distribution plots.
+Also includes n-gram motif analysis with Bonferroni significance testing.
 
-Model the timing of transitions between activity types as survival data. Estimate hazard rates for switching platforms or stopping an activity stream. Allows testing whether prior activities predict the time-to-next-event.
+### 2. Event History Analysis (`R/02_event_history.qmd`)
+**R packages:** `survival`, `survminer`, `broom`
 
-### 3. Hidden Markov Models (`R/03_hidden_markov.R`)
-**R packages:** `depmixS4`, `seqHMM`
+Model the timing of app switches as survival data. Kaplan-Meier curves show
+how long participants stay on an app before switching, stratified by app and
+category. Cox proportional hazards models test predictors of switching hazard
+including time of day, weekday, and position within a phone session.
 
-Fit HMMs to infer latent behavioral states from the observable sequence of app activities. Estimate the number of hidden states, emission probabilities per state, and transition matrix between states. Reveals underlying engagement patterns not visible in raw sequences.
+### 3. Hidden Markov Models (`R/03_hidden_markov.qmd`)
+**R package:** `depmixS4`
 
-### 4. Network Analysis (`R/04_network_analysis.R`)
-**R packages:** `igraph`, `ggraph`
+Fit categorical HMMs to infer latent behavioral states from the observable
+sequence of app uses. Model selection via AIC/BIC over k = 2–6 states. Outputs
+include the transition matrix, emission probabilities per state, and Viterbi-decoded
+state sequences visualised by hour of day.
 
-Build transition networks where nodes are activity types and weighted directed edges represent observed activity-to-activity transitions. Compute centrality measures to identify which activities act as hubs or gateways. Visualize cross-platform transition patterns.
+### 4. Network Analysis (`R/04_network_analysis.qmd`)
+**R packages:** `igraph`, `tidygraph`, `ggraph`
 
-### 5. Process Mining (`R/05_process_mining.R`)
-**R packages:** `bupaR`, `processmapR`
+Build a directed weighted transition network from consecutive app pairs.
+Compute centrality measures (degree, betweenness, eigenvector) and detect
+communities. Includes both app-level and category-level networks, plus a
+within-session network using `phone_session_id`.
 
-Treat the activity log as an event log in the process mining sense. Mine frequent process variants (ordered subsequences), render process maps, and compute conformance with hypothesized behavioral models (e.g., "browse → react → search").
+### 5. Process Mining (`R/05_process_mining.qmd`)
+**R packages:** `bupaR`, `processmapR`, `heuristicsmineR`
 
-### 6. Language-Based Models (`R/06_language_models.R`)
-**R packages:** `text2vec`, `word2vec`, or `tidytext` + embeddings
+Treat each person-day as a process case and each app use as an event.
+Discover directly-follows graphs, filter to top-k trace variants, fit a
+heuristics net, and plot event distributions by hour and weekday.
+Also produces a category transition duration heatmap.
 
-Treat each user's activity sequence as a "sentence" where activities are "words". Train sequence embeddings (e.g., activity2vec analogous to word2vec) to capture semantic similarity between activities and users based on co-occurrence patterns in sequences.
+### 6. Language-Based Models (`R/06_language_models.qmd`)
+**R packages:** `word2vec`, `doc2vec`, `Rtsne`, `umap`
+
+Treat app sequences as text. Activity2Vec (Word2Vec) learns embeddings for
+each app token (enriched with time-of-day context). Person2Vec (Doc2Vec)
+produces one embedding per participant, enabling person-level clustering and
+trajectory visualisation through the embedding space.
 
 ---
 
@@ -65,21 +90,20 @@ hackica26-app_sequences/
 │   ├── raw/            # original data files — gitignored, not committed
 │   └── processed/      # reshaped/cleaned data ready for analysis
 ├── R/
-│   ├── 00_data_prep.R            # load, clean, reshape to sequence format
-│   ├── 01_sequence_analysis.R    # TraMineR: state sequences, OM distance, clustering
-│   ├── 02_event_history.R        # survival models for transition timing
-│   ├── 03_hidden_markov.R        # HMMs for latent behavioral states
-│   ├── 04_network_analysis.R     # transition networks, centrality
-│   ├── 05_process_mining.R       # bupaR event logs, process maps
-│   └── 06_language_models.R      # sequence embeddings / activity2vec
+│   ├── 01_sequence_analysis.qmd
+│   ├── 02_event_history.qmd
+│   ├── 03_hidden_markov.qmd
+│   ├── 04_network_analysis.qmd
+│   ├── 05_process_mining.qmd
+│   └── 06_language_models.qmd
 ├── src/
 │   ├── data/           # shared data loading and wrangling helpers
 │   ├── analysis/       # shared analysis utilities
 │   └── visualization/  # shared plotting helpers
-├── notebooks/          # exploratory R Markdown / Quarto documents
+├── notebooks/          # exploratory notebooks
 ├── results/
-│   ├── figures/        # all output plots
-│   └── tables/         # all output tables / model summaries
+│   ├── figures/        # output plots
+│   └── tables/         # output tables and cached model objects
 └── .gitignore
 ```
 
@@ -87,36 +111,58 @@ hackica26-app_sequences/
 
 ## Data
 
-We cannot share the original dataset. The activity alphabet used in the reference study:
+**Source:** `uni_mainz_app_session.csv` (~20M rows) — app usage logs collected
+via the Murmuras passive tracking app. Cannot be shared publicly.
 
-| Platform  | Activity types |
-|-----------|---------------|
-| Facebook  | searches, reactions, last seen content, posts, likes & follows |
-| YouTube   | watch history, search history |
-| TikTok    | watched videos, favorite videos/effects/hashtags/sounds, search history, shared videos |
-| Instagram | likes, shared links, saved posts, comment history, search history |
+Relevant columns:
 
-Each record in the raw data represents a single user activity event with at minimum: `user_id`, a time variable (turn/timestamp), and `activity_type`.
+| Column             | Description |
+|--------------------|-------------|
+| `participant_code` | Participant identifier; links to survey data |
+| `app_name`         | Displayed app name (e.g., "Instagram", "Kalender") |
+| `package_name`     | Unique Android package name (e.g., `com.instagram.android`) |
+| `start_time`       | App session start (use this, not the epoch columns) |
+| `end_time`         | App session end |
+| `Duration`         | Duration in seconds (pre-computed) |
+| `phone_session_id` | Increments on each phone unlock; one session = one pickup |
+| `app_session_id`   | App-flow ID; has gaps for privacy-blacklisted apps (e.g., WhatsApp) |
+
+App categories (`app_category`) are not in the raw file — they are provided
+separately by the project as a `package_name → app_category` lookup.
+
+> **Note:** `seen_timestamp` and `end_timestamp` in the raw file are epoch/UNIX
+> values with a ~2 h CEST offset. Always use `start_time` / `end_time` instead.
 
 ---
 
 ## Getting started
 
 ```r
-# Install core dependencies
 install.packages(c(
-  "TraMineR",       # sequence analysis
-  "survival",       # event history
-  "survminer",      # survival visualization
-  "depmixS4",       # hidden Markov models
-  "seqHMM",         # HMMs for sequence data
-  "igraph",         # network analysis
-  "ggraph",         # network visualization
-  "bupaR",          # process mining
-  "processmapR",    # process maps
-  "tidyverse"       # data wrangling throughout
+  # Core
+  "tidyverse",
+  # Method 1 — sequence analysis
+  "TraMineR", "TraMineRextras", "colorspace", "cluster",
+  # Method 2 — event history
+  "survival", "survminer", "broom",
+  # Method 3 — hidden Markov models
+  "depmixS4",
+  # Method 4 — network analysis
+  "igraph", "tidygraph", "ggraph", "ggrepel",
+  # Method 5 — process mining
+  "bupaR", "processmapR", "heuristicsmineR",
+  # Method 6 — language models
+  "word2vec", "doc2vec", "Rtsne", "umap",
+  # Shared utilities
+  "patchwork", "scales", "RColorBrewer"
 ))
 ```
+
+To run an analysis, open the relevant `.qmd` file in RStudio and click
+**Render**, or run `quarto render R/01_sequence_analysis.qmd` from the terminal.
+Each file contains a synthetic data generator and runs end-to-end without
+real data. Swap in the real data by uncommenting the load block at the top
+of each file.
 
 ---
 

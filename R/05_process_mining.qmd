@@ -1,0 +1,460 @@
+---
+title: "Process Mining of App Usage"
+subtitle: "Method 5 — bupaR · ICA 2026 Hackathon"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(bupaR)
+library(processmapR)
+library(heuristicsmineR)
+library(scales)
+library(patchwork)
+```
+
+## Conceptual framing
+
+Process mining treats app usage as a **business process**: each person-day
+is a *case*, each app use is an *event*, and the sequence of events forms a
+*trace*. The goal is to discover recurring process patterns — frequent routes
+through the app landscape — and to visualise them as process models.
+
+The reference study (Fan et al., 2026) used `pm4py` in Python plus ProM Lite.
+We replicate the key analyses using the `bupaR` ecosystem in R:
+
+| Reference (pm4py / ProM) | This file (bupaR) |
+|--------------------------|-------------------|
+| `format_dataframe()` | `eventlog()` |
+| `filter_variants_top_k()` | `filter_top_variants()` |
+| `discover_dfg()` | `process_map(frequency())` |
+| `discover_heuristics_net()` | `heuristics_map()` |
+| `discover_bpmn_inductive()` | `process_map()` on filtered log |
+| Event distribution plots | `dotted_chart()`, manual ggplot |
+
+**Unit (case):** person-day — all app uses for one person on one calendar
+day. This keeps traces short enough for process models to be readable.
+
+**Activity:** `app_name` (fine-grained) or `app_category` (coarser).
+
+**Extension vs. reference:** We add an explicit `app_switch` event each time
+the person moves to a different app, making switches a first-class event in
+the process model — mirroring the `platform_switch` synthetic event in the
+reference.
+
+---
+
+## Data
+
+```{r load-data}
+# --- Real data (uncomment when available) ---
+# app_categories <- read_csv("data/raw/app_categories.csv")
+# df_raw <- read_csv(
+#   "data/raw/uni_mainz_app_session.csv",
+#   col_types = cols(
+#     participant_code = col_character(),
+#     start_time       = col_datetime(),
+#     end_time         = col_datetime(),
+#     Duration         = col_double(),
+#     phone_session_id = col_double(),
+#     package_name     = col_character(),
+#     app_name         = col_character(),
+#     .default         = col_skip()
+#   )
+# ) |>
+#   left_join(app_categories, by = "package_name") |>
+#   arrange(participant_code, start_time)
+
+# --- SYNTHETIC SAMPLE ---
+set.seed(42)
+pkg_to_app <- c(
+  "com.instagram.android" = "Instagram", "com.whatsapp" = "WhatsApp",
+  "com.zhiliaoapp.musically" = "TikTok", "com.google.android.youtube" = "YouTube",
+  "com.android.chrome" = "Chrome", "com.google.android.apps.maps" = "Maps",
+  "com.google.android.calculator" = "Rechner", "com.google.android.gm" = "Gmail",
+  "com.facebook.orca" = "Messenger", "com.spotify.music" = "Spotify"
+)
+pkg_to_cat <- c(
+  "com.instagram.android" = "social network", "com.whatsapp" = "communication",
+  "com.zhiliaoapp.musically" = "social network", "com.google.android.youtube" = "social network",
+  "com.android.chrome" = "tools", "com.google.android.apps.maps" = "tools",
+  "com.google.android.calculator" = "tools", "com.google.android.gm" = "communication",
+  "com.facebook.orca" = "communication", "com.spotify.music" = "entertainment"
+)
+pkg_names  <- names(pkg_to_app)
+pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
+
+df_raw <- map2_dfr(
+  paste0("P", sprintf("%03d", 1:60)),
+  sample(80:300, 60, replace = TRUE),
+  function(pid, n) {
+    starts <- as.POSIXct("2024-04-01 08:00:00") +
+      cumsum(c(0, sample(30:3600, n - 1, replace = TRUE)))
+    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
+    durs <- sample(10:900, n, replace = TRUE) + runif(n)
+    tibble(
+      participant_code = pid,
+      package_name = pkgs, app_name = pkg_to_app[pkgs],
+      app_category = pkg_to_cat[pkgs],
+      start_time = starts, end_time = starts + durs, Duration = durs
+    )
+  }
+) |> arrange(participant_code, start_time)
+# --- end synthetic sample ---
+```
+
+---
+
+## Data preparation
+
+### Merge consecutive same-app episodes
+
+```{r merge}
+gap_threshold <- 10 * 60
+
+merge_consecutive <- function(d, gap_sec) {
+  d <- arrange(d, start_time); out <- list(); cur <- d[1, ]
+  for (i in seq_len(nrow(d))[-1]) {
+    row <- d[i, ]
+    gap <- as.numeric(row$start_time - cur$end_time, units = "secs")
+    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
+      cur$end_time <- row$end_time; cur$Duration <- cur$Duration + row$Duration
+    } else { out <- c(out, list(cur)); cur <- row }
+  }
+  bind_rows(c(out, list(cur)))
+}
+
+df_merged <- df_raw |>
+  filter(Duration > 0) |>
+  group_by(participant_code) |>
+  group_modify(~ merge_consecutive(.x, gap_threshold)) |>
+  ungroup()
+```
+
+### Build event log format
+
+Cases are person-days. Each app-use episode is one event. We also inject a
+synthetic `[app switch]` event at each transition between different apps,
+mirroring the `platform_switch` event in the reference.
+
+```{r build-events}
+df_events <- df_merged |>
+  mutate(date = as.Date(start_time)) |>
+  # person-day case ID
+  group_by(participant_code, date) |>
+  mutate(
+    day_rank = cur_group_id(),
+    case_id  = paste0(participant_code, "_day", as.integer(date - min(date)) + 1),
+    next_app = lead(app_name)
+  ) |>
+  ungroup()
+
+# Inject [app switch] rows at each transition
+switch_rows <- df_events |>
+  filter(!is.na(next_app), app_name != next_app) |>
+  mutate(
+    app_name     = "[app switch]",
+    app_category = "switch",
+    # timestamp 1 second before the next event
+    start_time   = end_time - 1,
+    Duration     = NA_real_
+  )
+
+df_log_raw <- bind_rows(df_events, switch_rows) |>
+  arrange(case_id, start_time) |>
+  select(case_id, participant_code, app_name, app_category,
+         start_time, end_time, Duration)
+
+# Filter case lengths: 3 < events < 100 (mirrors reference filter)
+case_lengths <- df_log_raw |> count(case_id, name = "n_events")
+valid_cases  <- case_lengths |> filter(n_events > 3, n_events < 100) |> pull(case_id)
+
+df_log_raw <- df_log_raw |> filter(case_id %in% valid_cases)
+
+cat(sprintf(
+  "Event log: %d cases, %d events, %d unique activities\n",
+  n_distinct(df_log_raw$case_id),
+  nrow(df_log_raw),
+  n_distinct(df_log_raw$app_name)
+))
+```
+
+### Create bupaR event log
+
+```{r create-eventlog}
+# bupaR requires: case_id, activity_id, activity_instance_id,
+#                 lifecycle (start/complete), timestamp, resource
+df_bupar <- df_log_raw |>
+  mutate(
+    # Each row is a complete activity instance
+    activity_instance = row_number(),
+    lifecycle         = "complete",
+    resource          = app_category
+  )
+
+el <- eventlog(
+  df_bupar,
+  case_id              = "case_id",
+  activity_id          = "app_name",
+  activity_instance_id = "activity_instance",
+  lifecycle_id         = "lifecycle",
+  timestamp            = "start_time",
+  resource_id          = "resource"
+)
+
+summary(el)
+```
+
+---
+
+## Exploratory process analysis
+
+```{r activity-frequency}
+# Most frequent activities across all cases
+el |>
+  activity_frequency("activity") |>
+  arrange(desc(absolute)) |>
+  head(15) |>
+  knitr::kable(caption = "Top 15 most frequent activities")
+```
+
+```{r case-length-dist, fig.width=7, fig.height=3}
+el |>
+  case_info() |>
+  ggplot(aes(trace_length)) +
+  geom_histogram(bins = 30, fill = "#4E79A7", colour = "white") +
+  labs(x = "Events per case (person-day)", y = "Count",
+       title = "Case length distribution") +
+  theme_minimal()
+```
+
+```{r dotted-chart, fig.width=10, fig.height=6}
+# Dotted chart: one row per case, dots = events, x = time within case
+# Shows patterns across all cases at a glance
+el |>
+  dotted_chart(x = "relative", y = "start", color = "app_name") +
+  labs(title = "Dotted chart: app events within each person-day case")
+```
+
+---
+
+## Process maps (Directly Follows Graph)
+
+```{r process-map-freq, fig.width=10, fig.height=7}
+# Frequency-based process map — mirrors pm4py discover_dfg()
+el |>
+  process_map(
+    type         = frequency("relative"),
+    render       = TRUE
+  )
+```
+
+```{r process-map-perf, fig.width=10, fig.height=7}
+# Performance-based: median duration per activity
+# Only meaningful for activities with Duration recorded (excludes [app switch])
+el_timed <- df_bupar |>
+  filter(app_name != "[app switch]", !is.na(Duration)) |>
+  mutate(lifecycle = "complete") |>
+  eventlog(
+    case_id = "case_id", activity_id = "app_name",
+    activity_instance_id = "activity_instance",
+    lifecycle_id = "lifecycle", timestamp = "start_time",
+    resource_id = "resource"
+  )
+
+el_timed |>
+  process_map(
+    type   = performance(mean, units = "secs"),
+    render = TRUE
+  )
+```
+
+### Filter to top-k variants
+
+```{r top-variants}
+# Keep the top 10 most frequent trace variants (mirrors filter_variants_top_k)
+el_top10 <- el |> filter_top_variants(n = 10)
+
+cat(sprintf(
+  "Top 10 variants cover %d of %d cases (%.1f%%)\n",
+  n_case(el_top10), n_case(el),
+  100 * n_case(el_top10) / n_case(el)
+))
+
+# Show the variant list
+el_top10 |>
+  trace_coverage("case") |>
+  head(10) |>
+  knitr::kable(caption = "Top 10 most frequent trace variants")
+```
+
+```{r top-variants-map, fig.width=10, fig.height=7}
+el_top10 |>
+  process_map(type = frequency("relative"), render = TRUE)
+```
+
+---
+
+## Heuristics miner
+
+The heuristics miner is more noise-tolerant than the inductive miner and
+produces a *heuristics net* showing the most reliable activity connections.
+
+```{r heuristics-map, fig.width=10, fig.height=7}
+# dependency_threshold: only keep edges with dependency score > threshold
+# DECISION POINT: increase threshold to simplify the model
+el |>
+  heuristics_map(dependency_threshold = 0.5)
+```
+
+---
+
+## Event distribution analysis
+
+```{r hour-distribution, fig.width=8, fig.height=4}
+df_log_raw |>
+  filter(app_name != "[app switch]") |>
+  mutate(hour = as.integer(format(start_time, "%H"))) |>
+  count(hour, app_category) |>
+  group_by(hour) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  ggplot(aes(hour, pct, fill = app_category)) +
+  geom_col() +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  scale_fill_manual(values = c(
+    "social network" = "#F28E2B", "communication" = "#4E79A7",
+    "tools" = "#59A14F", "entertainment" = "#B07AA1",
+    "switch" = "#E0E0E0", "other" = "#BAB0AC"
+  )) +
+  labs(x = "Hour of day", y = "Proportion of events",
+       title = "App category usage by hour of day", fill = "Category") +
+  theme_minimal()
+```
+
+```{r weekday-distribution, fig.width=8, fig.height=4}
+df_log_raw |>
+  filter(app_name != "[app switch]") |>
+  mutate(weekday = weekdays(as.Date(start_time)),
+         weekday = factor(weekday, levels = c(
+           "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))) |>
+  count(weekday, app_category) |>
+  group_by(weekday) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  ggplot(aes(weekday, pct, fill = app_category)) +
+  geom_col() +
+  scale_fill_manual(values = c(
+    "social network" = "#F28E2B", "communication" = "#4E79A7",
+    "tools" = "#59A14F", "entertainment" = "#B07AA1",
+    "switch" = "#E0E0E0", "other" = "#BAB0AC"
+  )) +
+  labs(x = NULL, y = "Proportion", fill = "Category",
+       title = "App category usage by day of week") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## Category transition duration heatmap
+
+How long (median minutes) do people spend in each category before switching
+to each other category? Mirrors the platform transition heatmap in the
+reference (their `duration_time.csv`).
+
+```{r transition-heatmap, fig.width=6, fig.height=5}
+cat_pal_rocket <- c(
+  "social network" = "#F28E2B", "communication" = "#4E79A7",
+  "tools" = "#59A14F", "entertainment" = "#B07AA1"
+)
+core_cats <- names(cat_pal_rocket)
+
+df_transitions <- df_merged |>
+  filter(app_category %in% core_cats) |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  mutate(
+    next_cat = lead(app_category),
+    dur_min  = Duration / 60
+  ) |>
+  ungroup() |>
+  filter(!is.na(next_cat), app_category != next_cat,
+         next_cat %in% core_cats)
+
+heatmap_data <- df_transitions |>
+  group_by(from = app_category, to = next_cat) |>
+  summarise(median_dur_min = median(dur_min), .groups = "drop") |>
+  complete(from = core_cats, to = core_cats, fill = list(median_dur_min = NA))
+
+heatmap_data |>
+  ggplot(aes(to, from, fill = median_dur_min)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = ifelse(is.na(median_dur_min), "—",
+                               sprintf("%.1f", median_dur_min))),
+            size = 4) +
+  scale_fill_distiller(palette = "Reds", direction = 1, na.value = "grey90",
+                       name = "Median\nduration\n(min)") +
+  labs(x = "To category", y = "From category",
+       title = "Median duration before switching to each category") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 11),
+        axis.title = element_text(size = 11))
+```
+
+---
+
+## Category-level process map
+
+A coarser, more interpretable process map using `app_category` as the
+activity — cleaner for a paper figure than the app-level map.
+
+```{r cat-eventlog}
+df_bupar_cat <- df_log_raw |>
+  filter(app_name != "[app switch]") |>
+  mutate(
+    activity_instance = row_number(),
+    lifecycle         = "complete",
+    resource          = "all"
+  )
+
+el_cat <- eventlog(
+  df_bupar_cat,
+  case_id              = "case_id",
+  activity_id          = "app_category",
+  activity_instance_id = "activity_instance",
+  lifecycle_id         = "lifecycle",
+  timestamp            = "start_time",
+  resource_id          = "resource"
+)
+```
+
+```{r cat-process-map, fig.width=8, fig.height=6}
+el_cat |>
+  process_map(type = frequency("relative"), render = TRUE)
+```
+
+---
+
+## Summary of key outputs
+
+| Output | What it shows |
+|--------|--------------|
+| Activity frequency | Which apps appear most in the event log |
+| Case length distribution | How many app uses per person-day |
+| Dotted chart | All events across all cases at a glance |
+| Frequency process map | Most common app-to-app flows (= DFG) |
+| Performance process map | Mean duration spent per app |
+| Top-10 variant map | Most frequent full trace patterns |
+| Heuristics net | Noise-tolerant process model |
+| Hour / weekday distributions | Temporal rhythms of app use |
+| Transition duration heatmap | How long in each category before switching |
+| Category process map | Coarse-grained process model for the paper |

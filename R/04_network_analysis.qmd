@@ -1,0 +1,456 @@
+---
+title: "Network Analysis of App Transitions"
+subtitle: "Method 4 — igraph / ggraph · ICA 2026 Hackathon"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(scales)
+```
+
+## Conceptual framing
+
+We represent app-switching behaviour as a **directed weighted network**:
+
+- **Nodes** = apps (one per unique `app_name`)
+- **Directed edges** = observed transitions (app A immediately followed by app B)
+- **Edge weights** = count of that transition across all persons and time
+
+This directly mirrors Fan et al. (2026), who built the network from bigrams of
+activity-type sequences. We use consecutive app pairs from the merged sequences.
+
+Self-loops (same app → same app) are excluded — they are already compressed by
+the merging step, and within-app repetition is not informative for switching.
+
+Two network levels:
+1. **App-level** — fine-grained, nodes coloured by `app_category`
+2. **Category-level** — coarser, shows cross-category switching structure
+
+---
+
+## Data
+
+```{r load-data}
+# --- Real data (uncomment when available) ---
+# app_categories <- read_csv("data/raw/app_categories.csv")  # provided by project
+#
+# df_raw <- read_csv(
+#   "data/raw/uni_mainz_app_session.csv",
+#   col_types = cols(
+#     participant_code = col_character(),
+#     start_time       = col_datetime(),
+#     Duration         = col_double(),
+#     phone_session_id = col_double(),
+#     package_name     = col_character(),
+#     app_name         = col_character(),
+#     .default         = col_skip()
+#   )
+# ) |>
+#   left_join(app_categories, by = "package_name") |>
+#   arrange(participant_code, start_time)
+
+# --- SYNTHETIC SAMPLE for development ---
+set.seed(42)
+pkg_to_app <- c(
+  "com.instagram.android"         = "Instagram",
+  "com.whatsapp"                  = "WhatsApp",
+  "com.zhiliaoapp.musically"      = "TikTok",
+  "com.google.android.youtube"    = "YouTube",
+  "com.android.chrome"            = "Chrome",
+  "com.google.android.apps.maps"  = "Maps",
+  "com.google.android.calculator" = "Rechner",
+  "com.google.android.gm"         = "Gmail",
+  "com.facebook.orca"             = "Messenger",
+  "com.spotify.music"             = "Spotify"
+)
+pkg_to_cat <- c(
+  "com.instagram.android"         = "social network",
+  "com.whatsapp"                  = "communication",
+  "com.zhiliaoapp.musically"      = "social network",
+  "com.google.android.youtube"    = "social network",
+  "com.android.chrome"            = "tools",
+  "com.google.android.apps.maps"  = "tools",
+  "com.google.android.calculator" = "tools",
+  "com.google.android.gm"         = "communication",
+  "com.facebook.orca"             = "communication",
+  "com.spotify.music"             = "entertainment"
+)
+pkg_names <- names(pkg_to_app)
+pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
+
+df_raw <- map2_dfr(
+  paste0("P", sprintf("%03d", 1:80)),
+  sample(100:500, 80, replace = TRUE),
+  function(pid, n) {
+    starts <- as.POSIXct("2024-04-01 08:00:00") +
+      cumsum(c(0, sample(5:1800, n - 1, replace = TRUE)))
+    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
+    tibble(
+      participant_code = pid,
+      package_name     = pkgs,
+      app_name         = pkg_to_app[pkgs],
+      app_category     = pkg_to_cat[pkgs],
+      start_time       = starts,
+      Duration         = sample(5:900, n, replace = TRUE) + runif(n),
+      phone_session_id = cumsum(c(0, as.numeric(diff(starts)) > 300)) %% 100
+    )
+  }
+) |> arrange(participant_code, start_time)
+# --- end synthetic sample ---
+```
+
+---
+
+## Data preparation
+
+### Merge consecutive same-app episodes
+
+```{r merge}
+gap_threshold <- 10 * 60
+
+merge_consecutive <- function(d, gap_sec) {
+  d <- arrange(d, start_time)
+  out <- list(); cur <- d[1, ]
+  for (i in seq_len(nrow(d))[-1]) {
+    row <- d[i, ]
+    gap <- as.numeric(row$start_time - (cur$start_time + cur$Duration), units = "secs")
+    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
+      cur$Duration <- cur$Duration + row$Duration
+    } else {
+      out <- c(out, list(cur)); cur <- row
+    }
+  }
+  bind_rows(c(out, list(cur)))
+}
+
+df_merged <- df_raw |>
+  filter(Duration > 0) |>
+  group_by(participant_code) |>
+  group_modify(~ merge_consecutive(.x, gap_threshold)) |>
+  ungroup()
+```
+
+### Build edge list from consecutive app pairs
+
+```{r edge-list}
+# For the app-level network: transitions between app_name values
+edges_app <- df_merged |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  mutate(next_app = lead(app_name)) |>
+  ungroup() |>
+  filter(!is.na(next_app), app_name != next_app) |>   # remove self-loops
+  count(from = app_name, to = next_app, name = "weight") |>
+  arrange(desc(weight))
+
+# For the category-level network
+edges_cat <- df_merged |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  mutate(next_cat = lead(app_category)) |>
+  ungroup() |>
+  filter(!is.na(next_cat), app_category != next_cat) |>
+  count(from = app_category, to = next_cat, name = "weight") |>
+  arrange(desc(weight))
+
+cat("App-level edges (unique transitions):", nrow(edges_app), "\n")
+cat("Category-level edges:                ", nrow(edges_cat), "\n")
+
+head(edges_app, 10) |>
+  knitr::kable(caption = "Top 10 most frequent app transitions")
+```
+
+---
+
+## App-level network
+
+### Build graph
+
+```{r build-graph-app}
+# Node attributes: one row per app with category
+nodes_app <- df_merged |>
+  distinct(app_name, app_category) |>
+  rename(name = app_name)
+
+g_app <- tbl_graph(
+  nodes = nodes_app,
+  edges = edges_app,
+  directed = TRUE
+) |>
+  activate(nodes) |>
+  mutate(
+    degree_total = centrality_degree(mode = "all"),
+    degree_in    = centrality_degree(mode = "in"),
+    degree_out   = centrality_degree(mode = "out"),
+    closeness    = centrality_closeness(mode = "all"),
+    betweenness  = centrality_betweenness(directed = TRUE, weights = NULL),
+    eigenvector  = centrality_eigen(directed = FALSE)
+  )
+
+cat("Nodes:", igraph::vcount(g_app), "| Edges:", igraph::ecount(g_app), "\n")
+cat("Is directed:", igraph::is_directed(g_app), "\n")
+```
+
+### Centrality summary
+
+```{r centrality-table}
+g_app |>
+  activate(nodes) |>
+  as_tibble() |>
+  arrange(desc(degree_total)) |>
+  select(app = name, category = app_category,
+         degree = degree_total, in_deg = degree_in,
+         out_deg = degree_out, betweenness, eigenvector) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Node centrality measures (sorted by degree)")
+```
+
+```{r centrality-plot, fig.width=9, fig.height=4}
+cat_pal <- c(
+  "social network" = "#F28E2B",
+  "communication"  = "#4E79A7",
+  "tools"          = "#59A14F",
+  "entertainment"  = "#B07AA1",
+  "other"          = "#BAB0AC"
+)
+
+g_app |>
+  activate(nodes) |>
+  as_tibble() |>
+  pivot_longer(c(degree_in, degree_out, betweenness, eigenvector),
+               names_to = "measure", values_to = "value") |>
+  mutate(measure = recode(measure,
+    degree_in   = "In-degree",
+    degree_out  = "Out-degree",
+    betweenness = "Betweenness",
+    eigenvector = "Eigenvector"
+  )) |>
+  ggplot(aes(value, reorder(name, value), fill = app_category)) +
+  geom_col() +
+  facet_wrap(~measure, scales = "free_x") +
+  scale_fill_manual(values = cat_pal, na.value = "#BAB0AC") +
+  labs(x = NULL, y = NULL, fill = "Category",
+       title = "Centrality measures by app") +
+  theme_minimal() +
+  theme(legend.position = "bottom", axis.text.y = element_text(size = 8))
+```
+
+### Visualisation
+
+```{r network-viz-app, fig.width=10, fig.height=8}
+# Threshold: only draw edges above a minimum weight for legibility
+# DECISION POINT: adjust weight_threshold based on actual data volume
+weight_threshold <- quantile(edges_app$weight, 0.5)
+
+g_app |>
+  activate(edges) |>
+  filter(weight >= weight_threshold) |>
+  ggraph(layout = "fr") +   # Fruchterman-Reingold ≈ ForceAtlas2 in reference
+  geom_edge_arc(
+    aes(width = weight, alpha = weight),
+    colour    = "grey50",
+    arrow     = arrow(length = unit(3, "mm"), type = "closed"),
+    end_cap   = circle(4, "mm"),
+    strength  = 0.15
+  ) +
+  geom_node_point(
+    aes(size = degree_total, colour = app_category),
+    alpha = 0.9
+  ) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE, size = 3.2, colour = "grey20"
+  ) +
+  scale_edge_width(range = c(0.3, 3), guide = "none") +
+  scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
+  scale_size(range = c(3, 12), name = "Degree") +
+  scale_colour_manual(values = cat_pal, name = "Category",
+                      na.value = "#BAB0AC") +
+  labs(title = "App transition network",
+       subtitle = paste0("Edges ≥ ", round(weight_threshold),
+                         " transitions; node size = degree")) +
+  theme_graph(base_family = "sans") +
+  theme(legend.position = "right")
+```
+
+### Community detection
+
+```{r communities-app}
+# Convert to undirected for modularity-based community detection
+# (Louvain works on undirected; for directed use cluster_walktrap)
+g_undirected <- g_app |>
+  activate(edges) |>
+  mutate(weight = weight) |>
+  convert(to_undirected)
+
+communities <- cluster_louvain(g_undirected, weights = E(g_undirected)$weight)
+
+cat(sprintf(
+  "Communities detected: %d  |  Modularity: %.3f\n",
+  length(communities), modularity(communities)
+))
+
+# Assign community membership back to nodes
+g_app <- g_app |>
+  activate(nodes) |>
+  mutate(community = as.character(membership(communities)))
+
+g_app |>
+  activate(nodes) |>
+  as_tibble() |>
+  select(app = name, category = app_category, community) |>
+  arrange(community, app) |>
+  knitr::kable(caption = "Community membership per app")
+```
+
+```{r community-viz, fig.width=10, fig.height=8}
+g_app |>
+  activate(edges) |>
+  filter(weight >= weight_threshold) |>
+  ggraph(layout = "fr") +
+  geom_edge_arc(
+    aes(width = weight, alpha = weight),
+    colour   = "grey60",
+    arrow    = arrow(length = unit(3, "mm"), type = "closed"),
+    end_cap  = circle(4, "mm"),
+    strength = 0.15
+  ) +
+  geom_node_point(aes(size = degree_total, colour = community), alpha = 0.9) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.2) +
+  scale_edge_width(range = c(0.3, 3), guide = "none") +
+  scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
+  scale_size(range = c(3, 12), name = "Degree") +
+  scale_colour_brewer(palette = "Set2", name = "Community") +
+  labs(title = "App transition network — community structure") +
+  theme_graph(base_family = "sans") +
+  theme(legend.position = "right")
+```
+
+---
+
+## Category-level network
+
+Collapsing to categories reveals the cross-category switching structure
+more clearly and is easier to interpret in a paper figure.
+
+```{r build-graph-cat}
+nodes_cat <- tibble(name = sort(unique(c(edges_cat$from, edges_cat$to))))
+
+g_cat <- tbl_graph(nodes = nodes_cat, edges = edges_cat, directed = TRUE) |>
+  activate(nodes) |>
+  mutate(
+    degree_total = centrality_degree(mode = "all"),
+    strength_in  = centrality_degree(mode = "in",  weights = E(.)$weight),
+    strength_out = centrality_degree(mode = "out", weights = E(.)$weight)
+  )
+```
+
+```{r category-network-viz, fig.width=7, fig.height=6}
+# Normalise edge weights to proportions for the chord-diagram feel
+total_transitions <- sum(edges_cat$weight)
+
+g_cat |>
+  ggraph(layout = "circle") +
+  geom_edge_arc(
+    aes(width = weight / total_transitions * 100,
+        alpha = weight,
+        colour = from),
+    arrow    = arrow(length = unit(4, "mm"), type = "closed"),
+    end_cap  = circle(6, "mm"),
+    strength = 0.3
+  ) +
+  geom_node_point(aes(colour = name, size = degree_total)) +
+  geom_node_text(aes(label = name), vjust = -1.2, size = 4, fontface = "bold") +
+  scale_edge_width(range = c(0.5, 5), name = "% of transitions") +
+  scale_edge_alpha(range = c(0.3, 0.9), guide = "none") +
+  scale_edge_colour_manual(values = cat_pal, guide = "none") +
+  scale_colour_manual(values = cat_pal, name = "Category") +
+  scale_size(range = c(5, 15), name = "Degree") +
+  labs(title = "Category-level transition network") +
+  theme_graph(base_family = "sans") +
+  theme(legend.position = "right")
+```
+
+```{r category-transition-matrix}
+# Transition rate matrix (row = from, col = to)
+edges_cat |>
+  group_by(from) |>
+  mutate(rate = weight / sum(weight)) |>
+  ungroup() |>
+  select(from, to, rate) |>
+  pivot_wider(names_from = to, values_from = rate, values_fill = 0) |>
+  column_to_rownames("from") |>
+  round(3) |>
+  knitr::kable(caption = "Category transition rates (row sums to 1 within source category)")
+```
+
+---
+
+## Within-session network
+
+Building the network from within-session transitions only (no cross-session
+edges) gives a cleaner view of app-switching within a single phone pickup,
+uncontaminated by the natural break between sessions.
+
+```{r within-session-network}
+edges_session <- df_merged |>
+  arrange(participant_code, phone_session_id, start_time) |>
+  group_by(participant_code, phone_session_id) |>
+  mutate(next_app = lead(app_name)) |>
+  ungroup() |>
+  filter(!is.na(next_app), app_name != next_app) |>
+  count(from = app_name, to = next_app, name = "weight") |>
+  arrange(desc(weight))
+
+cat("Within-session transitions:\n")
+head(edges_session, 10) |> knitr::kable()
+```
+
+```{r session-vs-full-comparison}
+# What proportion of transitions are within-session vs. cross-session?
+total_all     <- sum(edges_app$weight)
+total_session <- sum(edges_session$weight)
+
+cat(sprintf(
+  "Within-session transitions: %d (%.1f%% of all transitions)\n",
+  total_session, 100 * total_session / total_all
+))
+
+# Are the most common transitions the same within-session vs. overall?
+left_join(
+  edges_app     |> slice_max(weight, n = 10) |> mutate(rank_all     = row_number()),
+  edges_session |> slice_max(weight, n = 10) |> mutate(rank_session = row_number()),
+  by = c("from", "to")
+) |>
+  select(from, to, weight_all = weight.x, rank_all,
+         weight_session = weight.y, rank_session) |>
+  knitr::kable(caption = "Top 10 transitions: full data vs. within-session")
+```
+
+---
+
+## Summary of key outputs
+
+| Output | What it shows |
+|--------|--------------|
+| Edge list | Raw bigram counts; most common app-to-app transitions |
+| Centrality table | Which apps are most central hubs in the switching network |
+| Centrality bar charts | In/out-degree, betweenness, eigenvector per app |
+| Force-directed network (app) | Full transition graph with node size = degree, colour = category |
+| Community detection | Whether apps cluster into switching communities |
+| Community network | Same graph coloured by community membership |
+| Category network | Cross-category switching structure (cleaner poster figure) |
+| Transition rate matrix | Conditional probability of switching from one category to another |
+| Within-session network | Transitions within a single phone pickup only |
