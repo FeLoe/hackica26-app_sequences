@@ -1,0 +1,12 @@
+# Raw data — not committed (sensitive user data)
+data/raw/*
+!data/raw/.gitkeep
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS
+.DS_Store
