@@ -19,6 +19,7 @@ library(survminer)
 library(broom)
 library(scales)
 library(splines)
+library(car)
 source("utils.R")
 ```
 
@@ -348,6 +349,21 @@ tidy(m2, exponentiate = TRUE, conf.int = TRUE) |>
   knitr::kable(digits = 3, caption = "Cox M2: app + time covariates")
 ```
 
+### Multicollinearity check (VIF)
+
+Before interpreting M2 coefficients, confirm that app, time, and weekday
+covariates do not carry redundant information (e.g., certain apps used only
+on weekends, or only at specific hours).
+
+```{r vif-m2}
+# car::vif() returns GVIF and GVIF^(1/(2*Df)) for multi-df terms (factors, splines).
+# Rule of thumb: GVIF^(1/(2*Df)) > 2 indicates problematic collinearity.
+vif(m2) |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  knitr::kable(digits = 2, caption = "Generalised VIF — Cox M2 covariates")
+```
+
 ```{r cox-forest, fig.height=5}
 # Forest plot on M1 (category level): M2 has ~115 app terms and is unreadable as a forest plot.
 tryCatch(
@@ -470,6 +486,7 @@ session_stats |>
 | KM by app           | Which apps hold attention longest                       |
 | KM by category      | Category-level switching speed                          |
 | Log-rank test       | Whether group survival curves differ significantly      |
+| VIF (M2)            | Whether app, time, and weekday covariates are collinear |
 | Cox M1              | Category-level hazard ratios                            |
 | Cox M2              | App-level HRs + time of day + weekday                  |
 | Cox M3              | Whether episode position within a session matters       |
