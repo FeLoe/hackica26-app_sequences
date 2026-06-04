@@ -53,7 +53,7 @@ Our data has two structural advantages the reference lacked:
 
 ```{r load-data}
 df_raw <- read_csv(
-  "../d_apps_two_participants.csv",
+  "../_files/d_apps_anonymized.csv",
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),
@@ -318,6 +318,11 @@ df_cox <- df_events |>
     app_category = factor(app_category),
     day_of_week  = factor(weekdays(as.Date(start_time)))
   )
+
+# M2/M3 restrict to top 20 apps — fitting 100+ app dummies on 860K rows
+# does not converge in reasonable time and the tail apps carry little signal.
+top20_apps <- df_cox |> count(app_name, sort = TRUE) |> slice_head(n = 20) |> pull(app_name)
+df_cox_top <- df_cox |> filter(app_name %in% top20_apps) |> mutate(app_name = droplevels(app_name))
 ```
 
 ### Model 1 — Category only
@@ -335,7 +340,7 @@ tidy(m1, exponentiate = TRUE, conf.int = TRUE) |>
 ```{r cox-m2}
 m2 <- coxph(
   Surv(duration_min, app_switch) ~ app_name + ns(hour_of_day, df = 4) + day_of_week,
-  data = df_cox
+  data = df_cox_top
 )
 
 tidy(m2, exponentiate = TRUE, conf.int = TRUE) |>
@@ -360,7 +365,7 @@ the person uses more apps within a single phone-unlock episode.
 m3 <- coxph(
   Surv(duration_min, app_switch) ~ app_name + ns(hour_of_day, df = 4) + day_of_week +
     episode_in_session,
-  data = df_cox
+  data = df_cox_top
 )
 
 # Likelihood-ratio comparison

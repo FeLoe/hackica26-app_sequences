@@ -5,7 +5,6 @@ gap_threshold <- 10 * 60  # seconds; 10-minute rule from Fan et al.
 # appear between genuine app uses whenever the user presses the home button.
 # They carry no behavioural information and inflate transition counts between
 # unrelated apps. Filter applied to df_merged immediately after merge_consecutive().
-noise_apps
 noise_apps <- c(
   # Home-screen launchers / system launchers
   "Pixel Launcher",

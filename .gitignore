@@ -12,6 +12,9 @@ R/*_files/
 # Generated model/result files
 R/results/
 
+# Data files — not committed (sensitive)
+_files/
+
 # Working notes
 FIXES.md
 
