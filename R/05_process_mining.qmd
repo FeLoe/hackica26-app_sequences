@@ -282,6 +282,23 @@ el_cat <- eventlog(
 )
 ```
 
+### Start and end activities
+
+Which category typically opens and closes a person-day?
+
+```{r start-end-cat}
+bind_rows(
+  el_cat |> start_activities(level = "activity") |> mutate(position = "start"),
+  el_cat |> end_activities(level = "activity")   |> mutate(position = "end")
+) |>
+  select(app_category, position, absolute, relative) |>
+  arrange(position, desc(absolute)) |>
+  knitr::kable(
+    digits = 3,
+    caption = "Which category begins and ends a person-day (relative = share of cases)"
+  )
+```
+
 ```{r cat-process-map, fig.width=8, fig.height=6}
 tryCatch(
   el_cat |> process_map(type = frequency("relative"), render = TRUE),
@@ -300,4 +317,5 @@ tryCatch(
 | Dotted chart | All events across all cases at a glance |
 | Hour / weekday distributions | Temporal rhythms of app use |
 | Transition duration heatmap | How long in each category before switching |
+| Start / end activities | Which category opens and closes a person-day |
 | Category process map | Interpretable process model for the paper |
