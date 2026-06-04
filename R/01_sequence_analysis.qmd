@@ -64,7 +64,7 @@ Extend the lookup table below once the actual package names are known.
 
 ```{r load-data}
 df_raw <- read_csv(
-  here::here("R/_files/d_apps_anonymized.csv"),
+  here::here("_files/d_apps_anonymized.csv"),
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),

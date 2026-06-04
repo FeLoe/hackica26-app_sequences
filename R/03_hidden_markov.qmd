@@ -57,7 +57,7 @@ rhythms.
 
 ```{r load-data}
 df_raw <- read_csv(
-  "../d_apps_two_participants.csv",
+  "../_files/d_apps_anonymized.csv",
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),
@@ -113,7 +113,7 @@ df_merged <- df_merged |>
 
 ```{r person-day-seqs}
 min_len <- 5   # minimum episodes per day
-max_len <- 50  # truncate long days (not discard — median is ~128 events/day)
+max_len <- 25  # truncate long days (not discard — median is ~128 events/day)
 
 df_seqs <- df_merged |>
   mutate(date = as.Date(start_time)) |>
@@ -189,8 +189,8 @@ get_emissions <- function(model, k, symbols, col_name = "symbol") {
 obs_cat    <- df_seqs |> arrange(participant_code, date, start_time) |> pull(cat_code)
 ntimes_cat <- seq_lengths |> arrange(participant_code, date) |> pull(len)
 
-n_restarts_cat <- 5   # DECISION POINT — increase to 10+ on full data
-k_range_cat    <- 2:6
+n_restarts_cat <- 2
+k_range_cat    <- 2:4
 
 cat(sprintf("Category HMM training: %d sequences, %d total observations\n",
             nrow(seq_lengths), length(obs_cat)))

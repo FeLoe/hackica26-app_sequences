@@ -45,7 +45,7 @@ Two network levels:
 
 ```{r load-data}
 df_raw <- read_csv(
-  "~/Downloads/d_apps_anonymized.csv",
+  "../_files/d_apps_anonymized.csv",
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),
