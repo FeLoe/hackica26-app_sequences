@@ -80,6 +80,7 @@ df_raw <- read_csv(
 ) |>
   rename(app_category = category, Duration = duration) |>
   mutate(app_category = translate_category(app_category)) |>
+  apply_category_overrides() |>
   arrange(participant_code, start_time)
 ```
 
@@ -202,7 +203,7 @@ cat("Vocabulary size:", length(vocab), "\n")
 
 find_similar <- function(token, model, n = 5) {
   tryCatch(
-    predict(model, token, type = "nearest", top_n = n) |>
+    predict(model, token, type = "nearest", top_n = n)[[1]] |>
       as_tibble() |>
       mutate(query = token) |>
       select(query, term2, similarity),
@@ -247,8 +248,10 @@ emb_top    <- emb_mat[rownames(emb_mat) %in% top_apps, , drop = FALSE]
 emb_df_top <- emb_df |> filter(token %in% top_apps)
 
 cat_pal <- c(
-  "social network" = "#F28E2B", "communication" = "#4E79A7",
-  "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+  "communication"  = "#4E79A7", "social media"   = "#F28E2B",
+  "entertainment"  = "#B07AA1", "gaming"         = "#E15759",
+  "utilities"      = "#59A14F", "shopping"       = "#76B7B2",
+  "practical life" = "#EDC948"
 )
 
 if (nrow(emb_top) > 15) {
@@ -354,7 +357,7 @@ person_stats <- df_tokens |>
   summarise(
     seq_len       = n(),
     dominant_cat  = names(which.max(table(app_category))),
-    pct_social    = mean(app_category == "social network"),
+    pct_social    = mean(app_category == "social media"),
     pct_comm      = mean(app_category == "communication"),
     .groups = "drop"
   )
@@ -384,8 +387,10 @@ umap_df <- tibble(
   left_join(person_stats, by = "participant_code")
 
 cat_pal <- c(
-  "social network" = "#F28E2B", "communication" = "#4E79A7",
-  "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+  "communication"  = "#4E79A7", "social media"   = "#F28E2B",
+  "entertainment"  = "#B07AA1", "gaming"         = "#E15759",
+  "utilities"      = "#59A14F", "shopping"       = "#76B7B2",
+  "practical life" = "#EDC948"
 )
 
 umap_df |>
@@ -532,9 +537,10 @@ if (nrow(traj_emb) >= 4) {
     # Points
     geom_point(data = traj_df, aes(x, y), colour = "black", size = 1.5) +
     scale_colour_manual(
-      values = c("social network" = "#F28E2B", "communication" = "#4E79A7",
-                 "tools" = "#59A14F", "entertainment" = "#B07AA1",
-                 "other" = "#BAB0AC",
+      values = c("communication"  = "#4E79A7", "social media"   = "#F28E2B",
+                 "entertainment"  = "#B07AA1", "gaming"         = "#E15759",
+                 "utilities"      = "#59A14F", "shopping"       = "#76B7B2",
+                 "practical life" = "#EDC948",
                  # trajectory step colours (recycled, hidden from legend)
                  setNames(RColorBrewer::brewer.pal(8, "PuRd"), as.character(0:7))),
       name = "Category"

@@ -211,48 +211,128 @@ noise_apps <- c(
   "One UI Home",
   "POCO Launcher",
   "ME Launcher",
-  "Discreet App-Starter"
+  "Discreet App-Starter",
+  " ME Launcher",
+  "(other app)"
 )
 
 cat_pal <- c(
-  "social network" = "#F28E2B",
   "communication"  = "#4E79A7",
-  "tools"          = "#59A14F",
+  "social media"   = "#F28E2B",
   "entertainment"  = "#B07AA1",
-  "other"          = "#BAB0AC"
+  "gaming"         = "#E15759",
+  "utilities"      = "#59A14F",
+  "shopping"       = "#76B7B2",
+  "practical life" = "#EDC948"
 )
 
-# Map raw Play-Store category strings (German) to the 5-bucket English scheme used
-# throughout. NA / empty / unknown categories → "other".
+# Map raw Play-Store category strings (German) to the 7-bucket English scheme used
+# throughout. NA / empty / unknown categories → NA.
 translate_category <- function(x) {
   mapping <- c(
-    "Soziale Netzwerke"           = "social network",
+    # Communication
     "Kommunikation"               = "communication",
-    "Tools"                       = "tools",
-    "Effizienz"                   = "tools",
-    "Unterhaltung"                = "entertainment",
-    "Musik & Audio"               = "entertainment",
-    "Action"                      = "entertainment",
-    "Rollenspiele"                = "entertainment",
+    "Dating"                      = "communication",
+
+    # Social media
+    "Soziale Netzwerke"           = "social media",
+
+    # Entertainment
     "Videoplayer & Editors"       = "entertainment",
-    "Finanzen"                    = "other",
-    "Shopping"                    = "other",
-    "Fotografie"                  = "other",
-    "Gesundheit & Fitness"        = "other",
-    "Karten & Navigation"         = "other",
-    "Lifestyle"                   = "other",
-    "Medizin"                     = "other",
-    "Nachrichten & Zeitschriften" = "other",
-    "Reisen & Lokales"            = "other",
-    "Sport"                       = "other",
-    "Business"                    = "other",
-    "Autos & Fahrzeuge"           = "other",
-    "Essen & Trinken"             = "other",
-    "Wetter"                      = "other"
+    "Musik & Audio"               = "entertainment",
+    "Musik"                       = "entertainment",
+    "Unterhaltung"                = "entertainment",
+    "Nachrichten & Zeitschriften" = "entertainment",
+    "Bücher & Nachschlagewerke"   = "entertainment",
+    "Fotografie"                  = "entertainment",
+
+    # Gaming
+    "Geduldsspiele"               = "gaming",
+    "Simulation"                  = "gaming",
+    "Karten"                      = "gaming",
+    "Strategie"                   = "gaming",
+    "Casino"                      = "gaming",
+    "Brettspiele"                 = "gaming",
+    "Action"                      = "gaming",
+    "Abenteuer"                   = "gaming",
+    "Worträtsel"                  = "gaming",
+    "Racing"                      = "gaming",
+    "Rollenspiele"                = "gaming",
+    "Quiz"                        = "gaming",
+    "Casual"                      = "gaming",
+
+    # Utilities
+    "Personalisierung"            = "utilities",
+    "Tools"                       = "utilities",
+    "Effizienz"                   = "utilities",
+    "Business"                    = "utilities",
+    "Software & Demos"            = "utilities",
+    "Wetter"                      = "utilities",
+    "Kunst & Design"              = "utilities",
+
+    # Shopping
+    "Shopping"                    = "shopping",
+    "Essen & Trinken"             = "shopping",
+    "Finanzen"                    = "shopping",
+
+    # Practical life
+    "Reisen & Lokales"            = "practical life",
+    "Karten & Navigation"         = "practical life",
+    "Autos & Fahrzeuge"           = "practical life",
+    "Haus & Garten"               = "practical life",
+    "Events"                      = "practical life",
+    "Eltern"                      = "practical life",
+    "Gesundheit & Fitness"        = "practical life",
+    "Sport"                       = "practical life",
+    "Medizin"                     = "practical life",
+    "Lernen"                      = "practical life",
+    "Lifestyle"                   = "practical life",
+    "Beauty"                      = "practical life"
   )
-  result        <- mapping[x]
-  result[is.na(result)] <- "other"
+  result <- mapping[x]
   unname(result)
+}
+
+# App-level overrides applied after translate_category().
+# Covers two cases:
+#   (a) apps whose Play Store category is wrong/missing (raw NA → correct bucket)
+#   (b) apps whose Play Store category is technically correct but behaviourally
+#       belongs elsewhere (e.g. Google Search filed under "Tools").
+apply_category_overrides <- function(df) {
+  dplyr::mutate(df, app_category = dplyr::case_when(
+    # (a) Explicit reclassifications regardless of raw category
+    app_name == "Google"            ~ "communication",
+
+    # Communication: phone, messaging, contacts apps without a Play Store category
+    app_name %in% c(
+      "Telefon", "Phone", "Anruf", "Call", "Kontakte", "Contacts",
+      "Nachrichten", "Messages", "Messenger", "ICQ",
+      "E-Mail", "Fennec"
+    ) ~ "communication",
+
+    # Entertainment: camera, gallery, media apps without a Play Store category
+    app_name %in% c(
+      "Kamera", "Camera", "Galerie", "Gallery",
+      "Fotos", "Photos", "Foto-Editor",
+      "Samsung Free", "Video Player"
+    ) ~ "entertainment",
+
+    # Gaming
+    app_name %in% c("Gaming Hub") ~ "gaming",
+
+    # Utilities: store, system tools, clock, weather, security without a category
+    app_name %in% c(
+      "Google Play Store", "Play Store", "Galaxy Store",
+      "Finder", "Uhr", "Clock", "Wetter", "Weather",
+      "Sicherheit", "Security", "Security Master", "Norton App Lock",
+      "Battery Doctor", "Screen Off and Lock",
+      "Notizen", "Dateien", "Media-Auswahl", "Bildschirmfoto",
+      "Smart-Aufnahme", "Kontoverwaltung"
+    ) ~ "utilities",
+
+    # (b) Default: keep existing value (including NA for truly unknown apps)
+    TRUE ~ app_category
+  ))
 }
 
 merge_consecutive <- function(d, gap_sec) {

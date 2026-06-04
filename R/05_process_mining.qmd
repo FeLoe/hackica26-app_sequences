@@ -68,6 +68,7 @@ df_raw <- read_csv(
 ) |>
   rename(app_category = category, Duration = duration) |>
   mutate(app_category = translate_category(app_category)) |>
+  apply_category_overrides() |>
   arrange(participant_code, start_time)
 ```
 
@@ -222,8 +223,10 @@ to each other category?
 
 ```{r transition-heatmap, fig.width=6, fig.height=5}
 cat_pal_rocket <- c(
-  "social network" = "#F28E2B", "communication" = "#4E79A7",
-  "tools" = "#59A14F", "entertainment" = "#B07AA1"
+  "communication"  = "#4E79A7", "social media"   = "#F28E2B",
+  "entertainment"  = "#B07AA1", "gaming"         = "#E15759",
+  "utilities"      = "#59A14F", "shopping"       = "#76B7B2",
+  "practical life" = "#EDC948"
 )
 core_cats <- names(cat_pal_rocket)
 

@@ -70,6 +70,7 @@ df_raw <- read_csv(
 ) |>
   rename(app_category = category, Duration = duration) |>
   mutate(app_category = translate_category(app_category)) |>
+  apply_category_overrides() |>
   arrange(participant_code, start_time)
 ```
 
@@ -173,8 +174,10 @@ df_events |>
 
 ```{r ccdf-by-category, fig.width=8, fig.height=4}
 cat_pal <- c(
-  "social network" = "#F28E2B", "communication" = "#4E79A7",
-  "tools" = "#59A14F", "entertainment" = "#B07AA1", "other" = "#BAB0AC"
+  "communication"  = "#4E79A7", "social media"   = "#F28E2B",
+  "entertainment"  = "#B07AA1", "gaming"         = "#E15759",
+  "utilities"      = "#59A14F", "shopping"       = "#76B7B2",
+  "practical life" = "#EDC948"
 )
 
 df_events |>

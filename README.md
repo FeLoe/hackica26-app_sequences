@@ -28,8 +28,8 @@ events, then ask:
 ## Analytical approaches
 
 All analyses live in `R/` as self-contained Quarto documents (`.qmd`).
-Each file includes a synthetic data generator at the top so it can be
-rendered and tested before real data arrives.
+Each file loads the real data from `_files/` and caches expensive intermediate
+results to `R/results/tables/`.
 
 ### 1. Sequence Analysis (`R/01_sequence_analysis.qmd`)
 **R packages:** `TraMineR`, `TraMineRextras`, `colorspace`, `cluster`
@@ -67,16 +67,16 @@ within-session network using `phone_session_id`.
 **R packages:** `bupaR`, `processmapR`, `heuristicsmineR`
 
 Treat each person-day as a process case and each app use as an event.
-Discover directly-follows graphs, filter to top-k trace variants, fit a
-heuristics net, and plot event distributions by hour and weekday.
-Also produces a category transition duration heatmap.
+Plots event distributions by hour and weekday, a category transition duration
+heatmap, and a category-level directly-follows process map with start/end
+activity analysis.
 
 ### 6. Language-Based Models (`R/06_language_models.qmd`)
 **R packages:** `word2vec`, `doc2vec`, `Rtsne`, `umap`
 
 Treat app sequences as text. Activity2Vec (Word2Vec) learns embeddings for
-each app token (enriched with time-of-day context). Person2Vec (Doc2Vec)
-produces one embedding per participant, enabling person-level clustering and
+each app token. Person2Vec (Doc2Vec) trains on per-day documents and averages
+to produce one embedding per participant, enabling person-level clustering and
 trajectory visualisation through the embedding space.
 
 ---
@@ -101,7 +101,7 @@ hackica26-app_sequences/
 
 ## Data
 
-**Source:** `uni_mainz_app_session.csv` (~20M rows) — app usage logs collected
+**Source:** `d_apps_anonymized.csv` — app usage logs collected
 via the Murmuras passive tracking app. Cannot be shared publicly.
 
 Relevant columns:
@@ -114,7 +114,7 @@ Relevant columns:
 | `start_time`       | App session start (use this, not the epoch columns) |
 | `end_time`         | App session end |
 | `Duration`         | Duration in seconds (pre-computed) |
-| `phone_session_id` | Increments on each phone unlock; one session = one pickup |
+| `phone_session_id` | Increments on each phone unlock (non-monotonic, resets irregularly — use for grouping only) |
 | `app_session_id`   | App-flow ID; has gaps for privacy-blacklisted apps (e.g., WhatsApp) |
 
 App categories (`app_category`) are not in the raw file — they are provided
@@ -134,25 +134,23 @@ install.packages(c(
   # Method 1 — sequence analysis
   "TraMineR", "TraMineRextras", "colorspace", "cluster",
   # Method 2 — event history
-  "survival", "survminer", "broom",
+  "survival", "survminer", "broom", "car",
   # Method 3 — hidden Markov models
   "depmixS4",
   # Method 4 — network analysis
   "igraph", "tidygraph", "ggraph", "ggrepel",
   # Method 5 — process mining
-  "bupaR", "processmapR", "heuristicsmineR",
+  "bupaR", "processmapR",
   # Method 6 — language models
   "word2vec", "doc2vec", "Rtsne", "umap",
   # Shared utilities
-  "patchwork", "scales", "RColorBrewer"
+  "patchwork", "scales", "RColorBrewer", "here"
 ))
 ```
 
 To run an analysis, open the relevant `.qmd` file in RStudio and click
 **Render**, or run `quarto render R/01_sequence_analysis.qmd` from the terminal.
-Each file contains a synthetic data generator and runs end-to-end without
-real data. Swap in the real data by uncommenting the load block at the top
-of each file.
+Place the data file at `_files/d_apps_anonymized.csv` before rendering.
 
 ---
 

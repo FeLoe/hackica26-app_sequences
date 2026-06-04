@@ -73,6 +73,7 @@ df_raw <- read_csv(
 ) |>
   rename(app_category = category, Duration = duration) |>
   mutate(app_category = translate_category(app_category)) |>
+  apply_category_overrides() |>
   arrange(participant_code, start_time)
 ```
 
@@ -284,8 +285,8 @@ as.data.frame(trans_mat) |>
 
 ### Emission probabilities
 
-Each state's emission distribution over the 5 app categories directly names
-what the state *is* — a peak on "social network" = a social browsing state, etc.
+Each state's emission distribution over the 7 app categories directly names
+what the state *is* — a peak on "social media" = a social browsing state, etc.
 
 ```{r cat-emissions}
 emissions_cat |>
