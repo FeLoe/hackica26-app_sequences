@@ -10,6 +10,8 @@ format:
 execute:
   warning: false
   message: false
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup}
@@ -101,13 +103,13 @@ df_raw |>
 # app_session_id gaps (blacklisted apps)
 n_missing_session <- sum(is.na(df_raw$app_session_id))
 cat(sprintf(
-  "Missing app_session_id: %d rows (%.1f%%) — likely blacklisted apps (e.g. WhatsApp)\n",
+  "Missing app_session_id: %f rows (%.1f%%) — likely blacklisted apps (e.g. WhatsApp)\n",
   n_missing_session, 100 * n_missing_session / nrow(df_raw)
 ))
 
 # phone_session_id range
 cat(sprintf(
-  "phone_session_id range: %d – %d\n",
+  "phone_session_id range: %f – %f\n",
   min(df_raw$phone_session_id, na.rm = TRUE),
   max(df_raw$phone_session_id, na.rm = TRUE)
 ))
