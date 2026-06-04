@@ -86,24 +86,14 @@ trajectory visualisation through the embedding space.
 ```
 hackica26-app_sequences/
 ├── README.md
-├── data/
-│   ├── raw/            # original data files — gitignored, not committed
-│   └── processed/      # reshaped/cleaned data ready for analysis
 ├── R/
+│   ├── utils.R                  # shared constants, palette, and merge_consecutive()
 │   ├── 01_sequence_analysis.qmd
 │   ├── 02_event_history.qmd
 │   ├── 03_hidden_markov.qmd
 │   ├── 04_network_analysis.qmd
 │   ├── 05_process_mining.qmd
 │   └── 06_language_models.qmd
-├── src/
-│   ├── data/           # shared data loading and wrangling helpers
-│   ├── analysis/       # shared analysis utilities
-│   └── visualization/  # shared plotting helpers
-├── notebooks/          # exploratory notebooks
-├── results/
-│   ├── figures/        # output plots
-│   └── tables/         # output tables and cached model objects
 └── .gitignore
 ```
 
