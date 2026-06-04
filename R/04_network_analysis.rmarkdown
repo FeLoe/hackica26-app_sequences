@@ -440,3 +440,4 @@ left_join(
 | Category network | Cross-category switching structure (cleaner poster figure) |
 | Transition rate matrix | Conditional probability of switching from one category to another |
 | Within-session network | Transitions within a single phone pickup only |
+
