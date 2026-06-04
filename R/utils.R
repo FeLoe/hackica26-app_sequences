@@ -209,7 +209,9 @@ noise_apps <- c(
   "X Google enrollment",
   "One UI-Startbildschirm",
   "One UI Home",
-  "POCO Launcher"
+  "POCO Launcher",
+  "ME Launcher",
+  "Discreet App-Starter"
 )
 
 cat_pal <- c(

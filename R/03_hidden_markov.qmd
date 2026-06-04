@@ -238,12 +238,31 @@ cat("BIC-optimal k (category HMM):", k_cat, "\n")
 best_cat_model <- hmm_cat_fits[[as.character(k_cat)]]
 ```
 
+```{r state-labels}
+# Auto-name each state from its dominant emission category.
+# If two states share the same top category, append the second as a qualifier.
+emissions_cat <- get_emissions(best_cat_model, k_cat, cat_levels, col_name = "category")
+
+state_labels <- emissions_cat |>
+  group_by(state) |>
+  arrange(desc(prob)) |>
+  summarise(top1 = first(category), top2 = nth(category, 2), .groups = "drop") |>
+  group_by(top1) |>
+  mutate(label = if_else(n() > 1, paste0(top1, " / ", top2), top1)) |>
+  ungroup() |>
+  dplyr::select(state, label) |>
+  deframe()
+
+cat("State labels:\n")
+print(state_labels)
+```
+
 ### Transition matrix
 
 ```{r cat-transition-matrix}
 trans_mat <- t(sapply(seq_len(k_cat), \(s) getpars(best_cat_model@transition[[s]])))
-dimnames(trans_mat) <- list(paste0("From S", seq_len(k_cat)),
-                            paste0("To S",   seq_len(k_cat)))
+labs <- state_labels[paste0("State ", seq_len(k_cat))]
+dimnames(trans_mat) <- list(paste0("From: ", labs), paste0("To: ", labs))
 
 round(trans_mat, 3) |>
   as.data.frame() |>
@@ -269,8 +288,6 @@ Each state's emission distribution over the 5 app categories directly names
 what the state *is* — a peak on "social network" = a social browsing state, etc.
 
 ```{r cat-emissions}
-emissions_cat <- get_emissions(best_cat_model, k_cat, cat_levels, col_name = "category")
-
 emissions_cat |>
   group_by(state) |>
   slice_max(prob, n = 2) |>
@@ -280,14 +297,14 @@ emissions_cat |>
 
 ```{r cat-emission-plot, fig.width=9, fig.height=4}
 emissions_cat |>
+  mutate(state = state_labels[state]) |>
   ggplot(aes(prob, category, fill = category)) +
   geom_col() +
   facet_wrap(~state, nrow = 1) +
   scale_fill_manual(values = cat_pal, guide = "none") +
   scale_x_continuous(labels = percent_format()) +
   labs(x = "Emission probability", y = NULL,
-       title = "Category emission probabilities per latent state",
-       subtitle = "The dominant category names the state") +
+       title = "Category emission probabilities per latent state") +
   theme_minimal() +
   theme(strip.text = element_text(face = "bold"))
 ```
@@ -296,7 +313,7 @@ emissions_cat |>
 
 ```{r cat-init-probs}
 init_probs <- getpars(best_cat_model)[seq_len(k_cat)]
-tibble(state = paste0("State ", seq_len(k_cat)), init_prob = init_probs) |>
+tibble(state = state_labels[paste0("State ", seq_len(k_cat))], init_prob = init_probs) |>
   knitr::kable(digits = 3, caption = "Initial state probabilities")
 ```
 
@@ -308,7 +325,7 @@ state_seq <- posterior(best_cat_model)
 df_decoded <- df_seqs |>
   arrange(participant_code, date, start_time) |>
   mutate(
-    state      = paste0("State ", state_seq$state),
+    state      = state_labels[paste0("State ", state_seq$state)],
     state_prob = apply(state_seq[, -1], 1, max)
   )
 ```
@@ -348,24 +365,6 @@ df_decoded |>
   labs(x = "Hour of day", y = "Proportion of episodes",
        title = "Latent state distribution by hour of day",
        fill  = "State") +
-  theme_minimal()
-```
-
-### Person-level state profiles
-
-```{r cat-state-by-person, fig.width=9, fig.height=4}
-df_decoded |>
-  count(participant_code, state) |>
-  group_by(participant_code) |>
-  mutate(pct = n / sum(n)) |>
-  ungroup() |>
-  ggplot(aes(x = state, y = pct, fill = state)) +
-  geom_col() +
-  facet_wrap(~participant_code, labeller = label_both) +
-  scale_fill_brewer(palette = "Set2", guide = "none") +
-  scale_y_continuous(labels = percent_format()) +
-  labs(x = NULL, y = "Share of episodes",
-       title = "Person-level state profiles") +
   theme_minimal()
 ```
 
@@ -502,6 +501,5 @@ if (!is.null(session_model)) {
 | Initial state probs | Which state people typically start in |
 | App enrichment table | Which specific apps dominate each decoded state |
 | State-by-hour plot | Daily rhythm of latent behavioral states |
-| Person-level profiles | How each person distributes across states |
 | App-level HMM | Whether within-category distinctions create additional states |
 | Session HMM | Whether pickup-level patterns differ from daily patterns |

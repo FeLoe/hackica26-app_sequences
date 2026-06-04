@@ -166,9 +166,8 @@ seq_len_dist |>
 seq_len_dist |>
   ggplot(aes(seq_length)) +
   geom_histogram(bins = 30, fill = "#4E79A7", colour = "white") +
-  facet_wrap(~participant_code, labeller = label_both) +
-  labs(x = "Events per day", y = "Days",
-       title = "Distribution of daily sequence lengths per person") +
+  labs(x = "Events per day", y = "Person-days",
+       title = "Distribution of daily sequence lengths (all participants)") +
   theme_minimal()
 ```
 
@@ -300,13 +299,8 @@ tryCatch(
 )
 ```
 
-```{r seqdplot-app, fig.width=10, fig.height=5}
-tryCatch(
-  seqdplot(app.seq, with.legend = FALSE, border = NA,
-           main = "State distribution over sequence position"),
-  error = function(e) message("seqdplot: ", conditionMessage(e))
-)
-```
+State distribution at the app level is unreadable with 50+ states; see the
+category-level `seqdplot` in the section below for the interpretable version.
 
 ```{r seqtrate-cat-inline}
 # App-level seqtrate would produce a 116×116 table — show category-level instead.
@@ -389,50 +383,33 @@ get_ngrams <- function(seq_list, n) {
 bigrams  <- get_ngrams(sequences_full$seq, 2)
 trigrams <- get_ngrams(sequences_full$seq, 3)
 
+# Drop self-loops (A→A, A→A→B, etc.) — merge_consecutive handles short-gap
+# returns; remaining same-app bigrams are trivial and dominate the ranking.
+has_self_loop <- function(ngram_vec) {
+  vapply(strsplit(ngram_vec, " -> "), \(s) any(s[-length(s)] == s[-1]), logical(1))
+}
+bigrams  <- bigrams[!has_self_loop(bigrams)]
+trigrams <- trigrams[!has_self_loop(trigrams)]
+
 base_freq <- prop.table(table(df_merged$app_name))
 
-# Build first-order transition matrix for the correct Markov null hypothesis.
-# Using P(A)×P(B|A) rather than P(A)×P(B) removes autocorrelation from the baseline,
-# so only bigrams that exceed what a Markov process would produce are flagged.
-trans_counts <- df_merged |>
-  arrange(participant_code, start_time) |>
-  group_by(participant_code) |>
-  mutate(next_app = lead(app_name)) |>
-  ungroup() |>
-  filter(!is.na(next_app)) |>
-  count(app_name, next_app)
-
-trans_probs <- trans_counts |>
-  group_by(app_name) |>
-  mutate(p_transition = n / sum(n)) |>
-  ungroup()
-
-test_ngrams <- function(ngram_vec, base_freq, trans_probs, alpha = 0.001) {
+# Independence null: P(A)×P(B) for bigrams, P(A)×P(B)×P(C) for trigrams.
+# Tests whether consecutive co-occurrence exceeds chance given marginal frequencies.
+# A Markov null (P(A)×P(B|A)) is circular when estimated from the same data —
+# the conditional probability already encodes the observed transition, forcing exp≈obs.
+test_ngrams <- function(ngram_vec, base_freq, alpha = 0.001, max_ngrams = 5000) {
   counts     <- sort(table(ngram_vec), decreasing = TRUE)
   total      <- sum(counts)
   bonf_alpha <- alpha / length(counts)
+  counts     <- head(counts, max_ngrams)
   result <- bind_rows(lapply(names(counts), function(ng) {
     states <- strsplit(ng, " -> ")[[1]]
     obs_p  <- counts[ng] / total
-    # First-order Markov null: P(A) × P(B|A) for bigrams; chain for trigrams
-    if (length(states) == 2) {
-      p_ba  <- trans_probs |> filter(app_name == states[1], next_app == states[2]) |>
-        pull(p_transition)
-      p_ba  <- if (length(p_ba) == 0) 0 else p_ba
-      exp_p <- base_freq[states[1]] * p_ba
-    } else {
-      p_ba  <- trans_probs |> filter(app_name == states[1], next_app == states[2]) |>
-        pull(p_transition)
-      p_ba  <- if (length(p_ba) == 0) 0 else p_ba
-      p_cb  <- trans_probs |> filter(app_name == states[2], next_app == states[3]) |>
-        pull(p_transition)
-      p_cb  <- if (length(p_cb) == 0) 0 else p_cb
-      exp_p <- base_freq[states[1]] * p_ba * p_cb
-    }
+    exp_p  <- prod(base_freq[states])
     if (is.na(exp_p) || exp_p == 0) return(NULL)
-    sd_p   <- sqrt(exp_p * (1 - exp_p) / total)
-    z      <- (obs_p - exp_p) / sd_p
-    p      <- 2 * pnorm(-abs(z))
+    sd_p <- sqrt(exp_p * (1 - exp_p) / total)
+    z    <- (obs_p - exp_p) / sd_p
+    p    <- 2 * pnorm(-abs(z))
     if (p < bonf_alpha)
       tibble(ngram = ng, observed = counts[ng],
              obs_pct = obs_p * 100, exp_pct = exp_p * 100,
@@ -445,8 +422,8 @@ test_ngrams <- function(ngram_vec, base_freq, trans_probs, alpha = 0.001) {
   result |> arrange(desc(z_score))
 }
 
-bigram_sig  <- test_ngrams(bigrams,  base_freq, trans_probs)
-trigram_sig <- test_ngrams(trigrams, base_freq, trans_probs)
+bigram_sig  <- test_ngrams(bigrams,  base_freq)
+trigram_sig <- test_ngrams(trigrams, base_freq)
 
 knitr::kable(head(bigram_sig,  10), digits = 3,
              caption = "Top over-represented bigrams (Bonferroni p < 0.001)")
@@ -479,7 +456,6 @@ if (file.exists(dist_om_path)) {
 n_seq <- nrow(dist_om)
 if (n_seq >= 3) {
   clust_ward <- agnes(dist_om, diss = TRUE, method = "ward")
-  plot(clust_ward, which.plot = 2, main = "Dendrogram — app sequences")
 } else {
   message("Fewer than 3 sequences — skipping clustering (needs full dataset)")
   clust_ward <- NULL
@@ -560,7 +536,6 @@ if (file.exists(dist_om_cat_path)) {
 n_seq_cat <- nrow(dist_om_cat)
 if (n_seq_cat >= 3) {
   clust_ward_cat <- agnes(dist_om_cat, diss = TRUE, method = "ward")
-  plot(clust_ward_cat, which.plot = 2, main = "Dendrogram — category sequences")
 } else {
   message("Fewer than 3 sequences — skipping category clustering")
   clust_ward_cat <- NULL
