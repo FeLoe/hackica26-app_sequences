@@ -16,7 +16,6 @@ execute:
 library(tidyverse)
 library(bupaR)
 library(processmapR)
-if (requireNamespace("heuristicsmineR", quietly = TRUE)) library(heuristicsmineR)
 library(scales)
 library(patchwork)
 source("utils.R")
@@ -35,18 +34,16 @@ We replicate the key analyses using the `bupaR` ecosystem in R:
 | Reference (pm4py / ProM) | This file (bupaR) |
 |--------------------------|-------------------|
 | `format_dataframe()` | `eventlog()` |
-| `filter_variants_top_k()` | `filter_top_variants()` |
-| `discover_dfg()` | `process_map(frequency())` |
-| `discover_heuristics_net()` | `heuristics_map()` |
-| `discover_bpmn_inductive()` | `process_map()` on filtered log |
+| `discover_dfg()` | `process_map(frequency())` on categories |
 | Event distribution plots | `dotted_chart()`, manual ggplot |
 
 **Unit (case):** person-day — all app uses for one person on one calendar
-day. This keeps traces short enough for process models to be readable.
+day. This keeps traces manageable.
 
-**Activity:** `app_name` (fine-grained) or `app_category` (coarser).
+**Activity:** `app_category` — app-level granularity produces unreadable
+process maps with 100+ nodes; category-level gives interpretable models.
 
-**Activity:** direct app usage episodes — Pixel Launcher, Xperia Home, and
+**Preprocessing:** direct app usage episodes — Pixel Launcher, Xperia Home, and
 any other home-screen artefacts are excluded (see `utils.R`).
 
 ---
@@ -55,7 +52,7 @@ any other home-screen artefacts are excluded (see `utils.R`).
 
 ```{r load-data}
 df_raw <- read_csv(
-  "../d_apps_two_participants.csv",
+  "../_files/d_apps_anonymized.csv",
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),
@@ -86,7 +83,7 @@ df_merged <- df_raw |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
   ungroup() |>
-  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
+  filter(!app_name %in% noise_apps)
 ```
 
 ### Build event log format
@@ -97,10 +94,7 @@ Cases are person-days. Each app-use episode is one event.
 df_events <- df_merged |>
   mutate(date = as.Date(start_time)) |>
   group_by(participant_code, date) |>
-  mutate(
-    case_id  = paste0(participant_code, "_", date),
-    next_app = lead(app_name)
-  ) |>
+  mutate(case_id = paste0(participant_code, "_", date)) |>
   ungroup()
 
 df_log_raw <- df_events |>
@@ -108,14 +102,13 @@ df_log_raw <- df_events |>
   select(case_id, participant_code, app_name, app_category,
          start_time, end_time, Duration)
 
-# Filter case lengths: 3 < events < 1000 (upper bound calibrated to this dataset)
+# Filter case lengths: 3 < events < 1000
 case_lengths <- df_log_raw |> count(case_id, name = "n_events")
 
 cat("Case length distribution (app events per person-day):\n")
 summary(case_lengths$n_events) |> print()
 
 valid_cases <- case_lengths |> filter(n_events > 3, n_events < 1000) |> pull(case_id)
-
 df_log_raw <- df_log_raw |> filter(case_id %in% valid_cases)
 
 cat(sprintf(
@@ -129,11 +122,8 @@ cat(sprintf(
 ### Create bupaR event log
 
 ```{r create-eventlog}
-# bupaR requires: case_id, activity_id, activity_instance_id,
-#                 lifecycle (start/complete), timestamp, resource
 df_bupar <- df_log_raw |>
   mutate(
-    # Each row is a complete activity instance
     activity_instance = row_number(),
     lifecycle         = "complete",
     resource          = app_category
@@ -157,7 +147,6 @@ summary(el)
 ## Exploratory process analysis
 
 ```{r activity-frequency}
-# Most frequent activities across all cases
 el |>
   activity_frequency("activity") |>
   arrange(desc(absolute)) |>
@@ -176,8 +165,6 @@ df_log_raw |>
 ```
 
 ```{r dotted-chart, fig.width=10, fig.height=6}
-# Dotted chart: one row per case, dots = events, x = time within case
-# Coloured by app_category (resource field) — 5 colours instead of 116
 tryCatch(
   print(el |>
     dotted_chart(x = "relative", color = "resource") +
@@ -186,172 +173,6 @@ tryCatch(
          colour = "Category")),
   error = function(e) message("dotted_chart: ", conditionMessage(e))
 )
-```
-
----
-
-## Process maps (Directly Follows Graph)
-
-```{r filter-top-activities}
-# With 100+ activities the full DFG is an unreadable hairball.
-# Keep only the top-N most frequent apps.
-top_n_activities <- 20  # DECISION POINT
-
-top_acts <- df_bupar |>
-  count(app_name, sort = TRUE) |>
-  slice_head(n = top_n_activities) |>
-  pull(app_name)
-
-df_bupar_small <- df_bupar |>
-  filter(app_name %in% top_acts) |>
-  mutate(activity_instance = row_number())
-
-el_small <- eventlog(
-  df_bupar_small,
-  case_id              = "case_id",
-  activity_id          = "app_name",
-  activity_instance_id = "activity_instance",
-  lifecycle_id         = "lifecycle",
-  timestamp            = "start_time",
-  resource_id          = "resource"
-)
-
-cat(sprintf(
-  "Reduced log: top %d activities, %d events retained of %d total\n",
-  top_n_activities, nrow(df_bupar_small), nrow(df_bupar)
-))
-```
-
-### Session-level process map (primary)
-
-Median trace length at the phone-session level is ~15 events — far more
-appropriate for process mining than person-day traces (~276 events).
-This session-level map is the primary analysis; the person-day map below
-is exploratory.
-
-**Caveat:** `phone_session_id` is documented as non-monotonic with unclear
-reset logic. Session boundaries here are taken at face value; validate against
-time-gap heuristics (e.g., gap > 30 min = new session) before publishing.
-
-```{r session-eventlog}
-# Build session-level log from df_merged (which retains phone_session_id).
-# df_log_raw drops phone_session_id in its select(), so we go back to the source.
-df_bupar_sess <- df_merged |>
-  mutate(
-    case_id_sess      = paste0(participant_code, "_", phone_session_id),
-    activity_instance = row_number(),
-    lifecycle         = "complete",
-    resource          = app_category
-  )
-
-el_sess <- eventlog(
-  df_bupar_sess,
-  case_id              = "case_id_sess",
-  activity_id          = "app_name",
-  activity_instance_id = "activity_instance",
-  lifecycle_id         = "lifecycle",
-  timestamp            = "start_time",
-  resource_id          = "resource"
-)
-
-# Apply the same top-N activity filter as the person-day log
-df_bupar_sess_small <- df_bupar_sess |>
-  filter(app_name %in% top_acts) |>
-  mutate(activity_instance = row_number())
-
-el_sess_small <- eventlog(
-  df_bupar_sess_small,
-  case_id              = "case_id_sess",
-  activity_id          = "app_name",
-  activity_instance_id = "activity_instance",
-  lifecycle_id         = "lifecycle",
-  timestamp            = "start_time",
-  resource_id          = "resource"
-)
-
-cat(sprintf(
-  "Session log: %d sessions, %d events (top-%d activities)\n",
-  bupaR::n_cases(el_sess_small), nrow(df_bupar_sess_small), top_n_activities
-))
-```
-
-```{r session-process-map, fig.width=10, fig.height=7}
-tryCatch(
-  el_sess_small |> process_map(type = frequency("relative"), render = TRUE),
-  error = function(e) message("session process_map: ", conditionMessage(e))
-)
-```
-
-### Person-day process map (exploratory)
-
-```{r process-map-freq, fig.width=10, fig.height=7}
-tryCatch(
-  el_small |> process_map(type = frequency("relative"), render = TRUE),
-  error = function(e) message("process_map: ", conditionMessage(e))
-)
-```
-
-```{r process-map-perf, fig.width=10, fig.height=7}
-# Performance-based: mean duration per activity (top-N apps only)
-el_timed <- df_bupar_small |>
-  filter(!is.na(Duration)) |>
-  mutate(activity_instance = row_number()) |>
-  eventlog(
-    case_id = "case_id", activity_id = "app_name",
-    activity_instance_id = "activity_instance",
-    lifecycle_id = "lifecycle", timestamp = "start_time",
-    resource_id = "resource"
-  )
-
-tryCatch(
-  el_timed |> process_map(type = performance(mean, units = "secs"), render = TRUE),
-  error = function(e) message("process_map perf: ", conditionMessage(e))
-)
-```
-
-### Filter to top-k variants
-
-```{r top-variants}
-# With 116 activities every person-day is a unique trace.
-# Filter by trace frequency on the reduced log where common sub-patterns can emerge.
-el_top10 <- tryCatch(
-  edeaR::filter_trace_frequency(el_small, percentage = 0.8),
-  error = function(e) { message("filter_trace_frequency: ", conditionMessage(e)); el_small }
-)
-
-cat(sprintf(
-  "Filtered log: %d of %d cases\n",
-  bupaR::n_cases(el_top10), bupaR::n_cases(el_small)
-))
-
-tryCatch(
-  print(edeaR::trace_coverage(el_top10, "case") |>
-    head(10) |>
-    knitr::kable(caption = "Most frequent trace variants (top-20 activities)")),
-  error = function(e) message("trace_coverage: ", conditionMessage(e))
-)
-```
-
-```{r top-variants-map, fig.width=10, fig.height=7}
-tryCatch(
-  el_top10 |> process_map(type = frequency("relative"), render = TRUE),
-  error = function(e) message("process_map top10: ", conditionMessage(e))
-)
-```
-
----
-
-## Heuristics miner
-
-The heuristics miner is more noise-tolerant than the inductive miner and
-produces a *heuristics net* showing the most reliable activity connections.
-
-```{r heuristics-map, fig.width=10, fig.height=7}
-if (requireNamespace("heuristicsmineR", quietly = TRUE)) {
-  el_small |> heuristicsmineR::heuristics_map(dependency_threshold = 0.5)
-} else {
-  message("heuristicsmineR not available — skipping heuristics map")
-}
 ```
 
 ---
@@ -397,8 +218,7 @@ df_log_raw |>
 ## Category transition duration heatmap
 
 How long (median minutes) do people spend in each category before switching
-to each other category? Mirrors the platform transition heatmap in the
-reference (their `duration_time.csv`).
+to each other category?
 
 ```{r transition-heatmap, fig.width=6, fig.height=5}
 cat_pal_rocket <- c(
@@ -443,9 +263,6 @@ heatmap_data |>
 
 ## Category-level process map
 
-A coarser, more interpretable process map using `app_category` as the
-activity — cleaner for a paper figure than the app-level map.
-
 ```{r cat-eventlog}
 df_bupar_cat <- df_log_raw |>
   mutate(
@@ -481,10 +298,6 @@ tryCatch(
 | Activity frequency | Which apps appear most in the event log |
 | Case length distribution | How many app uses per person-day |
 | Dotted chart | All events across all cases at a glance |
-| Frequency process map | Most common app-to-app flows (= DFG) |
-| Performance process map | Mean duration spent per app |
-| Top-10 variant map | Most frequent full trace patterns |
-| Heuristics net | Noise-tolerant process model |
 | Hour / weekday distributions | Temporal rhythms of app use |
 | Transition duration heatmap | How long in each category before switching |
-| Category process map | Coarse-grained process model for the paper |
+| Category process map | Interpretable process model for the paper |

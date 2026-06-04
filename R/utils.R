@@ -206,7 +206,10 @@ noise_apps <- c(
   "SmartWorld",
   "com.sonymobile.pocketmode2",
   "com.mediatek.batterywarning",
-  "X Google enrollment"
+  "X Google enrollment",
+  "One UI-Startbildschirm",
+  "One UI Home",
+  "POCO Launcher"
 )
 
 cat_pal <- c(
