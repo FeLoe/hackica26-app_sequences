@@ -185,13 +185,13 @@ get_emissions <- function(model, k, symbols, col_name = "symbol") {
 ### Model selection
 
 ```{r cat-model-selection}
-# Category-level: 5 emission symbols → no sequence sampling needed.
+# Category-level: 7 emission symbols → no sequence sampling needed.
 # Scales to the full 1000-person dataset without modification.
 obs_cat    <- df_seqs |> arrange(participant_code, date, start_time) |> pull(cat_code)
 ntimes_cat <- seq_lengths |> arrange(participant_code, date) |> pull(len)
 
 n_restarts_cat <- 2
-k_range_cat    <- 2:4
+k_range_cat    <- 2:6
 
 cat(sprintf("Category HMM training: %d sequences, %d total observations\n",
             nrow(seq_lengths), length(obs_cat)))
@@ -199,8 +199,9 @@ cat(sprintf("Category HMM training: %d sequences, %d total observations\n",
 cache_cat <- "results/tables/hmm_cat_models.rds"
 if (file.exists(cache_cat)) {
   hmm_cat_fits <- readRDS(cache_cat)
-  # Invalidate if trained on different data
-  if (!identical(attr(hmm_cat_fits, "ntimes"), ntimes_cat)) {
+  # Invalidate if trained on different data or different category count
+  if (!identical(attr(hmm_cat_fits, "ntimes"), ntimes_cat) ||
+      !identical(attr(hmm_cat_fits, "n_cat"), length(cat_levels))) {
     hmm_cat_fits <- NULL
   }
 }
@@ -209,6 +210,7 @@ if (!exists("hmm_cat_fits") || is.null(hmm_cat_fits)) {
   hmm_cat_fits <- lapply(setNames(k_range_cat, k_range_cat), \(k)
     fit_hmm(k, obs_cat, ntimes_cat, n_restarts_cat, length(cat_levels)))
   attr(hmm_cat_fits, "ntimes") <- ntimes_cat
+  attr(hmm_cat_fits, "n_cat")  <- length(cat_levels)
   saveRDS(hmm_cat_fits, cache_cat)
 }
 
@@ -249,7 +251,7 @@ state_labels <- emissions_cat |>
   arrange(desc(prob)) |>
   summarise(top1 = first(category), top2 = nth(category, 2), .groups = "drop") |>
   group_by(top1) |>
-  mutate(label = if_else(n() > 1, paste0(top1, " / ", top2), top1)) |>
+  mutate(label = if (n() > 1) paste0(top1, " / ", top2) else top1) |>
   ungroup() |>
   dplyr::select(state, label) |>
   deframe()
