@@ -16,9 +16,10 @@ execute:
 library(tidyverse)
 library(bupaR)
 library(processmapR)
-library(heuristicsmineR)
+if (requireNamespace("heuristicsmineR", quietly = TRUE)) library(heuristicsmineR)
 library(scales)
 library(patchwork)
+source("utils.R")
 ```
 
 ## Conceptual framing
@@ -45,70 +46,32 @@ day. This keeps traces short enough for process models to be readable.
 
 **Activity:** `app_name` (fine-grained) or `app_category` (coarser).
 
-**Extension vs. reference:** We add an explicit `app_switch` event each time
-the person moves to a different app, making switches a first-class event in
-the process model — mirroring the `platform_switch` synthetic event in the
-reference.
+**Activity:** direct app usage episodes — Pixel Launcher, Xperia Home, and
+any other home-screen artefacts are excluded (see `utils.R`).
 
 ---
 
 ## Data
 
 ```{r load-data}
-# --- Real data (uncomment when available) ---
-# app_categories <- read_csv("data/raw/app_categories.csv")
-# df_raw <- read_csv(
-#   "data/raw/uni_mainz_app_session.csv",
-#   col_types = cols(
-#     participant_code = col_character(),
-#     start_time       = col_datetime(),
-#     end_time         = col_datetime(),
-#     Duration         = col_double(),
-#     phone_session_id = col_double(),
-#     package_name     = col_character(),
-#     app_name         = col_character(),
-#     .default         = col_skip()
-#   )
-# ) |>
-#   left_join(app_categories, by = "package_name") |>
-#   arrange(participant_code, start_time)
-
-# --- SYNTHETIC SAMPLE ---
-set.seed(42)
-pkg_to_app <- c(
-  "com.instagram.android" = "Instagram", "com.whatsapp" = "WhatsApp",
-  "com.zhiliaoapp.musically" = "TikTok", "com.google.android.youtube" = "YouTube",
-  "com.android.chrome" = "Chrome", "com.google.android.apps.maps" = "Maps",
-  "com.google.android.calculator" = "Rechner", "com.google.android.gm" = "Gmail",
-  "com.facebook.orca" = "Messenger", "com.spotify.music" = "Spotify"
-)
-pkg_to_cat <- c(
-  "com.instagram.android" = "social network", "com.whatsapp" = "communication",
-  "com.zhiliaoapp.musically" = "social network", "com.google.android.youtube" = "social network",
-  "com.android.chrome" = "tools", "com.google.android.apps.maps" = "tools",
-  "com.google.android.calculator" = "tools", "com.google.android.gm" = "communication",
-  "com.facebook.orca" = "communication", "com.spotify.music" = "entertainment"
-)
-pkg_names  <- names(pkg_to_app)
-pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
-
-df_raw <- map2_dfr(
-  paste0("P", sprintf("%03d", 1:60)),
-  sample(80:300, 60, replace = TRUE),
-  function(pid, n) {
-    starts <- as.POSIXct("2024-04-01 08:00:00") +
-      cumsum(c(0, sample(30:3600, n - 1, replace = TRUE)))
-    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
-    durs <- sample(10:900, n, replace = TRUE) + runif(n)
-    tibble(
-      participant_code = pid,
-      package_name = pkgs, app_name = pkg_to_app[pkgs],
-      app_category = pkg_to_cat[pkgs],
-      start_time = starts, end_time = starts + durs, Duration = durs
-    )
-  }
-) |> arrange(participant_code, start_time)
-# --- end synthetic sample ---
+df_raw <- read_csv(
+  "../d_apps_two_participants.csv",
+  col_types = cols(
+    participant_code = col_character(),
+    start_time       = col_datetime(),
+    end_time         = col_datetime(),
+    duration         = col_double(),
+    phone_session_id = col_double(),
+    app_session_id   = col_double(),
+    package_name     = col_character(),
+    app_name         = col_character(),
+    category         = col_character(),
+    .default         = col_skip()
+  )
+) |>
+  rename(app_category = category, Duration = duration) |>
+  mutate(app_category = translate_category(app_category)) |>
+  arrange(participant_code, start_time)
 ```
 
 ---
@@ -118,64 +81,40 @@ df_raw <- map2_dfr(
 ### Merge consecutive same-app episodes
 
 ```{r merge}
-gap_threshold <- 10 * 60
-
-merge_consecutive <- function(d, gap_sec) {
-  d <- arrange(d, start_time); out <- list(); cur <- d[1, ]
-  for (i in seq_len(nrow(d))[-1]) {
-    row <- d[i, ]
-    gap <- as.numeric(row$start_time - cur$end_time, units = "secs")
-    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
-      cur$end_time <- row$end_time; cur$Duration <- cur$Duration + row$Duration
-    } else { out <- c(out, list(cur)); cur <- row }
-  }
-  bind_rows(c(out, list(cur)))
-}
-
 df_merged <- df_raw |>
   filter(Duration > 0) |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
-  ungroup()
+  ungroup() |>
+  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
 ```
 
 ### Build event log format
 
-Cases are person-days. Each app-use episode is one event. We also inject a
-synthetic `[app switch]` event at each transition between different apps,
-mirroring the `platform_switch` event in the reference.
+Cases are person-days. Each app-use episode is one event.
 
 ```{r build-events}
 df_events <- df_merged |>
   mutate(date = as.Date(start_time)) |>
-  # person-day case ID
   group_by(participant_code, date) |>
   mutate(
-    day_rank = cur_group_id(),
-    case_id  = paste0(participant_code, "_day", as.integer(date - min(date)) + 1),
+    case_id  = paste0(participant_code, "_", date),
     next_app = lead(app_name)
   ) |>
   ungroup()
 
-# Inject [app switch] rows at each transition
-switch_rows <- df_events |>
-  filter(!is.na(next_app), app_name != next_app) |>
-  mutate(
-    app_name     = "[app switch]",
-    app_category = "switch",
-    # timestamp 1 second before the next event
-    start_time   = end_time - 1,
-    Duration     = NA_real_
-  )
-
-df_log_raw <- bind_rows(df_events, switch_rows) |>
+df_log_raw <- df_events |>
   arrange(case_id, start_time) |>
   select(case_id, participant_code, app_name, app_category,
          start_time, end_time, Duration)
 
-# Filter case lengths: 3 < events < 100 (mirrors reference filter)
+# Filter case lengths: 3 < events < 1000 (upper bound calibrated to this dataset)
 case_lengths <- df_log_raw |> count(case_id, name = "n_events")
-valid_cases  <- case_lengths |> filter(n_events > 3, n_events < 100) |> pull(case_id)
+
+cat("Case length distribution (app events per person-day):\n")
+summary(case_lengths$n_events) |> print()
+
+valid_cases <- case_lengths |> filter(n_events > 3, n_events < 1000) |> pull(case_id)
 
 df_log_raw <- df_log_raw |> filter(case_id %in% valid_cases)
 
@@ -227,8 +166,8 @@ el |>
 ```
 
 ```{r case-length-dist, fig.width=7, fig.height=3}
-el |>
-  case_info() |>
+df_log_raw |>
+  count(case_id, name = "trace_length") |>
   ggplot(aes(trace_length)) +
   geom_histogram(bins = 30, fill = "#4E79A7", colour = "white") +
   labs(x = "Events per case (person-day)", y = "Count",
@@ -238,31 +177,125 @@ el |>
 
 ```{r dotted-chart, fig.width=10, fig.height=6}
 # Dotted chart: one row per case, dots = events, x = time within case
-# Shows patterns across all cases at a glance
-el |>
-  dotted_chart(x = "relative", y = "start", color = "app_name") +
-  labs(title = "Dotted chart: app events within each person-day case")
+# Coloured by app_category (resource field) — 5 colours instead of 116
+tryCatch(
+  print(el |>
+    dotted_chart(x = "relative", color = "resource") +
+    scale_color_manual(values = cat_pal) +
+    labs(title = "Dotted chart: app category events within each person-day case",
+         colour = "Category")),
+  error = function(e) message("dotted_chart: ", conditionMessage(e))
+)
 ```
 
 ---
 
 ## Process maps (Directly Follows Graph)
 
-```{r process-map-freq, fig.width=10, fig.height=7}
-# Frequency-based process map — mirrors pm4py discover_dfg()
-el |>
-  process_map(
-    type         = frequency("relative"),
-    render       = TRUE
+```{r filter-top-activities}
+# With 100+ activities the full DFG is an unreadable hairball.
+# Keep only the top-N most frequent apps.
+top_n_activities <- 20  # DECISION POINT
+
+top_acts <- df_bupar |>
+  count(app_name, sort = TRUE) |>
+  slice_head(n = top_n_activities) |>
+  pull(app_name)
+
+df_bupar_small <- df_bupar |>
+  filter(app_name %in% top_acts) |>
+  mutate(activity_instance = row_number())
+
+el_small <- eventlog(
+  df_bupar_small,
+  case_id              = "case_id",
+  activity_id          = "app_name",
+  activity_instance_id = "activity_instance",
+  lifecycle_id         = "lifecycle",
+  timestamp            = "start_time",
+  resource_id          = "resource"
+)
+
+cat(sprintf(
+  "Reduced log: top %d activities, %d events retained of %d total\n",
+  top_n_activities, nrow(df_bupar_small), nrow(df_bupar)
+))
+```
+
+### Session-level process map (primary)
+
+Median trace length at the phone-session level is ~15 events — far more
+appropriate for process mining than person-day traces (~276 events).
+This session-level map is the primary analysis; the person-day map below
+is exploratory.
+
+**Caveat:** `phone_session_id` is documented as non-monotonic with unclear
+reset logic. Session boundaries here are taken at face value; validate against
+time-gap heuristics (e.g., gap > 30 min = new session) before publishing.
+
+```{r session-eventlog}
+# Build session-level log from df_merged (which retains phone_session_id).
+# df_log_raw drops phone_session_id in its select(), so we go back to the source.
+df_bupar_sess <- df_merged |>
+  mutate(
+    case_id_sess      = paste0(participant_code, "_", phone_session_id),
+    activity_instance = row_number(),
+    lifecycle         = "complete",
+    resource          = app_category
   )
+
+el_sess <- eventlog(
+  df_bupar_sess,
+  case_id              = "case_id_sess",
+  activity_id          = "app_name",
+  activity_instance_id = "activity_instance",
+  lifecycle_id         = "lifecycle",
+  timestamp            = "start_time",
+  resource_id          = "resource"
+)
+
+# Apply the same top-N activity filter as the person-day log
+df_bupar_sess_small <- df_bupar_sess |>
+  filter(app_name %in% top_acts) |>
+  mutate(activity_instance = row_number())
+
+el_sess_small <- eventlog(
+  df_bupar_sess_small,
+  case_id              = "case_id_sess",
+  activity_id          = "app_name",
+  activity_instance_id = "activity_instance",
+  lifecycle_id         = "lifecycle",
+  timestamp            = "start_time",
+  resource_id          = "resource"
+)
+
+cat(sprintf(
+  "Session log: %d sessions, %d events (top-%d activities)\n",
+  bupaR::n_cases(el_sess_small), nrow(df_bupar_sess_small), top_n_activities
+))
+```
+
+```{r session-process-map, fig.width=10, fig.height=7}
+tryCatch(
+  el_sess_small |> process_map(type = frequency("relative"), render = TRUE),
+  error = function(e) message("session process_map: ", conditionMessage(e))
+)
+```
+
+### Person-day process map (exploratory)
+
+```{r process-map-freq, fig.width=10, fig.height=7}
+tryCatch(
+  el_small |> process_map(type = frequency("relative"), render = TRUE),
+  error = function(e) message("process_map: ", conditionMessage(e))
+)
 ```
 
 ```{r process-map-perf, fig.width=10, fig.height=7}
-# Performance-based: median duration per activity
-# Only meaningful for activities with Duration recorded (excludes [app switch])
-el_timed <- df_bupar |>
-  filter(app_name != "[app switch]", !is.na(Duration)) |>
-  mutate(lifecycle = "complete") |>
+# Performance-based: mean duration per activity (top-N apps only)
+el_timed <- df_bupar_small |>
+  filter(!is.na(Duration)) |>
+  mutate(activity_instance = row_number()) |>
   eventlog(
     case_id = "case_id", activity_id = "app_name",
     activity_instance_id = "activity_instance",
@@ -270,35 +303,40 @@ el_timed <- df_bupar |>
     resource_id = "resource"
   )
 
-el_timed |>
-  process_map(
-    type   = performance(mean, units = "secs"),
-    render = TRUE
-  )
+tryCatch(
+  el_timed |> process_map(type = performance(mean, units = "secs"), render = TRUE),
+  error = function(e) message("process_map perf: ", conditionMessage(e))
+)
 ```
 
 ### Filter to top-k variants
 
 ```{r top-variants}
-# Keep the top 10 most frequent trace variants (mirrors filter_variants_top_k)
-el_top10 <- el |> filter_top_variants(n = 10)
+# With 116 activities every person-day is a unique trace.
+# Filter by trace frequency on the reduced log where common sub-patterns can emerge.
+el_top10 <- tryCatch(
+  edeaR::filter_trace_frequency(el_small, percentage = 0.8),
+  error = function(e) { message("filter_trace_frequency: ", conditionMessage(e)); el_small }
+)
 
 cat(sprintf(
-  "Top 10 variants cover %d of %d cases (%.1f%%)\n",
-  n_case(el_top10), n_case(el),
-  100 * n_case(el_top10) / n_case(el)
+  "Filtered log: %d of %d cases\n",
+  bupaR::n_cases(el_top10), bupaR::n_cases(el_small)
 ))
 
-# Show the variant list
-el_top10 |>
-  trace_coverage("case") |>
-  head(10) |>
-  knitr::kable(caption = "Top 10 most frequent trace variants")
+tryCatch(
+  print(edeaR::trace_coverage(el_top10, "case") |>
+    head(10) |>
+    knitr::kable(caption = "Most frequent trace variants (top-20 activities)")),
+  error = function(e) message("trace_coverage: ", conditionMessage(e))
+)
 ```
 
 ```{r top-variants-map, fig.width=10, fig.height=7}
-el_top10 |>
-  process_map(type = frequency("relative"), render = TRUE)
+tryCatch(
+  el_top10 |> process_map(type = frequency("relative"), render = TRUE),
+  error = function(e) message("process_map top10: ", conditionMessage(e))
+)
 ```
 
 ---
@@ -309,10 +347,11 @@ The heuristics miner is more noise-tolerant than the inductive miner and
 produces a *heuristics net* showing the most reliable activity connections.
 
 ```{r heuristics-map, fig.width=10, fig.height=7}
-# dependency_threshold: only keep edges with dependency score > threshold
-# DECISION POINT: increase threshold to simplify the model
-el |>
-  heuristics_map(dependency_threshold = 0.5)
+if (requireNamespace("heuristicsmineR", quietly = TRUE)) {
+  el_small |> heuristicsmineR::heuristics_map(dependency_threshold = 0.5)
+} else {
+  message("heuristicsmineR not available — skipping heuristics map")
+}
 ```
 
 ---
@@ -321,7 +360,6 @@ el |>
 
 ```{r hour-distribution, fig.width=8, fig.height=4}
 df_log_raw |>
-  filter(app_name != "[app switch]") |>
   mutate(hour = as.integer(format(start_time, "%H"))) |>
   count(hour, app_category) |>
   group_by(hour) |>
@@ -330,11 +368,7 @@ df_log_raw |>
   ggplot(aes(hour, pct, fill = app_category)) +
   geom_col() +
   scale_x_continuous(breaks = seq(0, 23, 2)) +
-  scale_fill_manual(values = c(
-    "social network" = "#F28E2B", "communication" = "#4E79A7",
-    "tools" = "#59A14F", "entertainment" = "#B07AA1",
-    "switch" = "#E0E0E0", "other" = "#BAB0AC"
-  )) +
+  scale_fill_manual(values = cat_pal) +
   labs(x = "Hour of day", y = "Proportion of events",
        title = "App category usage by hour of day", fill = "Category") +
   theme_minimal()
@@ -342,7 +376,6 @@ df_log_raw |>
 
 ```{r weekday-distribution, fig.width=8, fig.height=4}
 df_log_raw |>
-  filter(app_name != "[app switch]") |>
   mutate(weekday = weekdays(as.Date(start_time)),
          weekday = factor(weekday, levels = c(
            "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))) |>
@@ -352,11 +385,7 @@ df_log_raw |>
   ungroup() |>
   ggplot(aes(weekday, pct, fill = app_category)) +
   geom_col() +
-  scale_fill_manual(values = c(
-    "social network" = "#F28E2B", "communication" = "#4E79A7",
-    "tools" = "#59A14F", "entertainment" = "#B07AA1",
-    "switch" = "#E0E0E0", "other" = "#BAB0AC"
-  )) +
+  scale_fill_manual(values = cat_pal) +
   labs(x = NULL, y = "Proportion", fill = "Category",
        title = "App category usage by day of week") +
   theme_minimal() +
@@ -419,7 +448,6 @@ activity — cleaner for a paper figure than the app-level map.
 
 ```{r cat-eventlog}
 df_bupar_cat <- df_log_raw |>
-  filter(app_name != "[app switch]") |>
   mutate(
     activity_instance = row_number(),
     lifecycle         = "complete",
@@ -438,8 +466,10 @@ el_cat <- eventlog(
 ```
 
 ```{r cat-process-map, fig.width=8, fig.height=6}
-el_cat |>
-  process_map(type = frequency("relative"), render = TRUE)
+tryCatch(
+  el_cat |> process_map(type = frequency("relative"), render = TRUE),
+  error = function(e) message("process_map cat: ", conditionMessage(e))
+)
 ```
 
 ---

@@ -18,6 +18,8 @@ library(survival)
 library(survminer)
 library(broom)
 library(scales)
+library(splines)
+source("utils.R")
 ```
 
 ## Conceptual framing
@@ -50,82 +52,24 @@ Our data has two structural advantages the reference lacked:
 **Source:** `uni_mainz_app_session.csv` (~20M rows).
 
 ```{r load-data}
-# --- Real data (uncomment when available) ---
-# app_category comes from a project-provided lookup file (package_name → app_category)
-# app_categories <- read_csv("data/raw/app_categories.csv")  # provided by project
-#
-# df_raw <- read_csv(
-#   "data/raw/uni_mainz_app_session.csv",
-#   col_types = cols(
-#     participant_code = col_character(),
-#     start_time       = col_datetime(),
-#     end_time         = col_datetime(),
-#     Duration         = col_double(),
-#     phone_session_id = col_double(),
-#     app_session_id   = col_double(),
-#     package_name     = col_character(),
-#     app_name         = col_character(),
-#     .default         = col_skip()
-#   )
-# ) |>
-#   left_join(app_categories, by = "package_name") |>
-#   arrange(participant_code, start_time)
-
-# --- SYNTHETIC SAMPLE for development ---
-set.seed(42)
-
-pkg_to_app <- c(
-  "com.instagram.android"         = "Instagram",
-  "com.whatsapp"                  = "WhatsApp",
-  "com.zhiliaoapp.musically"      = "TikTok",
-  "com.google.android.youtube"    = "YouTube",
-  "com.android.chrome"            = "Chrome",
-  "com.google.android.apps.maps"  = "Maps",
-  "com.google.android.calculator" = "Rechner",
-  "com.google.android.gm"         = "Gmail",
-  "com.facebook.orca"             = "Messenger",
-  "com.spotify.music"             = "Spotify"
-)
-pkg_to_cat <- c(
-  "com.instagram.android"         = "social network",
-  "com.whatsapp"                  = "communication",
-  "com.zhiliaoapp.musically"      = "social network",
-  "com.google.android.youtube"    = "social network",
-  "com.android.chrome"            = "tools",
-  "com.google.android.apps.maps"  = "tools",
-  "com.google.android.calculator" = "tools",
-  "com.google.android.gm"         = "communication",
-  "com.facebook.orca"             = "communication",
-  "com.spotify.music"             = "entertainment"
-)
-pkg_names <- names(pkg_to_app)
-pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
-
-n_persons <- 80
-events_per <- sample(50:200, n_persons, replace = TRUE)
-
-df_raw <- map2_dfr(
-  paste0("P", sprintf("%03d", seq_len(n_persons))),
-  events_per,
-  function(pid, n) {
-    starts <- as.POSIXct("2024-04-01 08:00:00") +
-      cumsum(c(0, sample(5:1800, n - 1, replace = TRUE)))
-    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
-    durs <- sample(5:900, n, replace = TRUE) + runif(n)
-    tibble(
-      participant_code = pid,
-      package_name     = pkgs,
-      app_name         = pkg_to_app[pkgs],
-      app_category     = pkg_to_cat[pkgs],
-      start_time       = starts,
-      end_time         = starts + durs,
-      Duration         = durs,
-      phone_session_id = cumsum(c(0, as.numeric(diff(starts)) > 300)) %% 100,
-      app_session_id   = ifelse(pkgs == "com.whatsapp", NA_real_, seq_along(pkgs))
-    )
-  }
-) |> arrange(participant_code, start_time)
-# --- end synthetic sample ---
+df_raw <- read_csv(
+  "../d_apps_two_participants.csv",
+  col_types = cols(
+    participant_code = col_character(),
+    start_time       = col_datetime(),
+    end_time         = col_datetime(),
+    duration         = col_double(),
+    phone_session_id = col_double(),
+    app_session_id   = col_double(),
+    package_name     = col_character(),
+    app_name         = col_character(),
+    category         = col_character(),
+    .default         = col_skip()
+  )
+) |>
+  rename(app_category = category, Duration = duration) |>
+  mutate(app_category = translate_category(app_category)) |>
+  arrange(participant_code, start_time)
 ```
 
 ---
@@ -137,31 +81,13 @@ df_raw <- map2_dfr(
 Same 10-minute rule as Method 1. When merging, durations are summed.
 
 ```{r merge-episodes}
-gap_threshold <- 10 * 60  # seconds
-
-merge_consecutive <- function(d, gap_sec) {
-  d <- arrange(d, start_time)
-  out <- list()
-  cur <- d[1, ]
-  for (i in seq_len(nrow(d))[-1]) {
-    row <- d[i, ]
-    gap <- as.numeric(row$start_time - cur$end_time, units = "secs")
-    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
-      cur$end_time <- row$end_time
-      cur$Duration <- cur$Duration + row$Duration
-    } else {
-      out <- c(out, list(cur))
-      cur <- row
-    }
-  }
-  bind_rows(c(out, list(cur)))
-}
-
 df_merged <- df_raw |>
   filter(!is.na(participant_code), Duration > 0) |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
-  ungroup()
+  ungroup() |>
+  filter(Duration >= 2) |>           # drop sub-2-second launcher/system artefacts
+  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
 ```
 
 ### Step 2 — Define switch events
@@ -169,21 +95,33 @@ df_merged <- df_raw |>
 ```{r define-events}
 df_events <- df_merged |>
   mutate(duration_min = Duration / 60) |>
+  arrange(participant_code, start_time) |>
   group_by(participant_code) |>
   mutate(
-    app_switch = as.integer(!is.na(lead(app_name)) & lead(app_name) != app_name),
-    cat_switch = as.integer(!is.na(lead(app_category)) & lead(app_category) != app_category),
-    # Last episode per person: no observed switch → right-censored
+    next_app        = lead(app_name),
+    next_session_id = lead(phone_session_id),
+    next_category   = lead(app_category),
+    # Observed switch: different app AND within the same phone session.
+    # Episodes ending a session are censored (phone put down = not an app switch).
+    app_switch = as.integer(
+      !is.na(next_app) &
+      next_app != app_name &
+      next_session_id == phone_session_id
+    ),
+    cat_switch = as.integer(
+      !is.na(next_category) &
+      next_category != app_category &
+      next_session_id == phone_session_id
+    ),
     app_switch = replace_na(app_switch, 0),
     cat_switch = replace_na(cat_switch, 0),
-    # Position in phone session (meaningful: phone_session_id = unlock event)
     episode_in_session = row_number(),  # within person; refine per session below
   ) |>
   ungroup()
 
-# NOTE on app_session_id: gaps exist where apps are blacklisted (e.g., WhatsApp).
-# This does NOT affect the survival analysis, which is based on app_name not app_session_id.
-# But it means we may undercount true app switches where WhatsApp is involved.
+# NOTE: session-boundary censoring relies on phone_session_id reliability.
+# The codebook notes non-monotonic IDs and unclear reset logic — verify with
+# the data provider before publishing session-boundary-dependent results.
 cat(sprintf(
   "Rows with missing app_session_id (blacklisted apps): %d (%.1f%%)\n",
   sum(is.na(df_events$app_session_id)),
@@ -320,15 +258,28 @@ km_cat <- survfit(
   data = df_events
 )
 
-ggsurvplot(
-  km_cat, data = df_events,
-  conf.int = TRUE, pval = TRUE, pval.method = TRUE,
-  palette  = unname(cat_pal[sort(unique(df_events$app_category))]),
-  xlab = "Duration (minutes)",
-  ylab = "P(staying in same category)",
-  title = "Time until category switch, by category",
-  legend.title = "Category",
-  ggtheme = theme_minimal()
+tryCatch(
+  print(ggsurvplot(
+    km_cat, data = df_events,
+    conf.int = TRUE, pval = TRUE, pval.method = TRUE,
+    xlab = "Duration (minutes)",
+    ylab = "P(staying in same category)",
+    title = "Time until category switch, by category",
+    legend.title = "Category",
+    ggtheme = theme_minimal()
+  )),
+  error = function(e) {
+    message("ggsurvplot conf.int incompatible with this ggplot2 version — rendering without CI")
+    print(ggsurvplot(
+      km_cat, data = df_events,
+      conf.int = FALSE, pval = TRUE, pval.method = TRUE,
+      xlab = "Duration (minutes)",
+      ylab = "P(staying in same category)",
+      title = "Time until category switch, by category",
+      legend.title = "Category",
+      ggtheme = theme_minimal()
+    ))
+  }
 )
 ```
 
@@ -354,17 +305,18 @@ episode_pos <- df_events |>
   group_by(participant_code, phone_session_id) |>
   mutate(episode_in_session = row_number()) |>
   ungroup() |>
-  select(participant_code, phone_session_id, start_time, episode_in_session)
+  select(participant_code, phone_session_id, start_time,
+         episode_in_session_sess = episode_in_session)
 
 df_cox <- df_events |>
   left_join(episode_pos,
             by = c("participant_code", "phone_session_id", "start_time")) |>
   mutate(
+    episode_in_session = episode_in_session_sess,
     hour_of_day  = as.integer(format(start_time, "%H")),
-    day_of_week  = weekdays(as.Date(start_time)),
-    app_name     = relevel(factor(app_name),     ref = "Chrome"),
-    app_category = relevel(factor(app_category), ref = "tools"),
-    day_of_week  = relevel(factor(day_of_week),  ref = "Monday")
+    app_name     = factor(app_name),
+    app_category = factor(app_category),
+    day_of_week  = factor(weekdays(as.Date(start_time)))
   )
 ```
 
@@ -381,10 +333,8 @@ tidy(m1, exponentiate = TRUE, conf.int = TRUE) |>
 ### Model 2 — App + time of day + weekday
 
 ```{r cox-m2}
-# DECISION POINT: add/remove predictors to match your RQ.
-# hour_of_day: linear here; use splines (splines::ns()) if effect is non-linear.
 m2 <- coxph(
-  Surv(duration_min, app_switch) ~ app_name + hour_of_day + day_of_week,
+  Surv(duration_min, app_switch) ~ app_name + ns(hour_of_day, df = 4) + day_of_week,
   data = df_cox
 )
 
@@ -393,8 +343,12 @@ tidy(m2, exponentiate = TRUE, conf.int = TRUE) |>
   knitr::kable(digits = 3, caption = "Cox M2: app + time covariates")
 ```
 
-```{r cox-forest, fig.height=7}
-ggforest(m2, data = df_cox, main = "Hazard ratios for app switching (Cox M2)")
+```{r cox-forest, fig.height=5}
+# Forest plot on M1 (category level): M2 has ~115 app terms and is unreadable as a forest plot.
+tryCatch(
+  ggforest(m1, data = df_cox, main = "Hazard ratios for app switching — by category (Cox M1)"),
+  error = function(e) message("ggforest: ", conditionMessage(e))
+)
 ```
 
 ### Model 3 — Add phone session position
@@ -404,7 +358,7 @@ the person uses more apps within a single phone-unlock episode.
 
 ```{r cox-m3}
 m3 <- coxph(
-  Surv(duration_min, app_switch) ~ app_name + hour_of_day + day_of_week +
+  Surv(duration_min, app_switch) ~ app_name + ns(hour_of_day, df = 4) + day_of_week +
     episode_in_session,
   data = df_cox
 )
@@ -421,9 +375,14 @@ tidy(m3, exponentiate = TRUE, conf.int = TRUE) |>
 ### Proportional hazards assumption
 
 ```{r ph-test}
-ph_test <- cox.zph(m2)
-print(ph_test)
-ggcoxzph(ph_test)
+# M1 (category only): clean diagnostic — 5 terms, interpretable plots
+ph_test_m1 <- cox.zph(m1)
+print(ph_test_m1)
+ggcoxzph(ph_test_m1)
+
+# M2 (app + time + weekday): 115+ terms — print table only, skip ggcoxzph
+ph_test_m2 <- cox.zph(m2)
+print(ph_test_m2)
 ```
 
 ---
@@ -448,13 +407,26 @@ km_session <- survfit(
   data = df_session
 )
 
-ggsurvplot(
-  km_session, data = df_session,
-  conf.int = TRUE, pval = TRUE,
-  legend.labs = c("Later in session", "First app of session"),
-  xlab = "Duration (minutes)",
-  title = "First vs. later app within a phone session",
-  ggtheme = theme_minimal()
+tryCatch(
+  print(ggsurvplot(
+    km_session, data = df_session,
+    conf.int = TRUE, pval = TRUE,
+    legend.labs = c("Later in session", "First app of session"),
+    xlab = "Duration (minutes)",
+    title = "First vs. later app within a phone session",
+    ggtheme = theme_minimal()
+  )),
+  error = function(e) {
+    message("ggsurvplot conf.int incompatible with this ggplot2 version — rendering without CI")
+    print(ggsurvplot(
+      km_session, data = df_session,
+      conf.int = FALSE, pval = TRUE,
+      legend.labs = c("Later in session", "First app of session"),
+      xlab = "Duration (minutes)",
+      title = "First vs. later app within a phone session",
+      ggtheme = theme_minimal()
+    ))
+  }
 )
 ```
 

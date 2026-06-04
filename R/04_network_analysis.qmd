@@ -18,6 +18,7 @@ library(igraph)
 library(tidygraph)
 library(ggraph)
 library(scales)
+source("utils.R")
 ```
 
 ## Conceptual framing
@@ -43,72 +44,27 @@ Two network levels:
 ## Data
 
 ```{r load-data}
-# --- Real data (uncomment when available) ---
-# app_categories <- read_csv("data/raw/app_categories.csv")  # provided by project
-#
-# df_raw <- read_csv(
-#   "data/raw/uni_mainz_app_session.csv",
-#   col_types = cols(
-#     participant_code = col_character(),
-#     start_time       = col_datetime(),
-#     Duration         = col_double(),
-#     phone_session_id = col_double(),
-#     package_name     = col_character(),
-#     app_name         = col_character(),
-#     .default         = col_skip()
-#   )
-# ) |>
-#   left_join(app_categories, by = "package_name") |>
-#   arrange(participant_code, start_time)
-
-# --- SYNTHETIC SAMPLE for development ---
-set.seed(42)
-pkg_to_app <- c(
-  "com.instagram.android"         = "Instagram",
-  "com.whatsapp"                  = "WhatsApp",
-  "com.zhiliaoapp.musically"      = "TikTok",
-  "com.google.android.youtube"    = "YouTube",
-  "com.android.chrome"            = "Chrome",
-  "com.google.android.apps.maps"  = "Maps",
-  "com.google.android.calculator" = "Rechner",
-  "com.google.android.gm"         = "Gmail",
-  "com.facebook.orca"             = "Messenger",
-  "com.spotify.music"             = "Spotify"
-)
-pkg_to_cat <- c(
-  "com.instagram.android"         = "social network",
-  "com.whatsapp"                  = "communication",
-  "com.zhiliaoapp.musically"      = "social network",
-  "com.google.android.youtube"    = "social network",
-  "com.android.chrome"            = "tools",
-  "com.google.android.apps.maps"  = "tools",
-  "com.google.android.calculator" = "tools",
-  "com.google.android.gm"         = "communication",
-  "com.facebook.orca"             = "communication",
-  "com.spotify.music"             = "entertainment"
-)
-pkg_names <- names(pkg_to_app)
-pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
-
-df_raw <- map2_dfr(
-  paste0("P", sprintf("%03d", 1:80)),
-  sample(100:500, 80, replace = TRUE),
-  function(pid, n) {
-    starts <- as.POSIXct("2024-04-01 08:00:00") +
-      cumsum(c(0, sample(5:1800, n - 1, replace = TRUE)))
-    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
-    tibble(
-      participant_code = pid,
-      package_name     = pkgs,
-      app_name         = pkg_to_app[pkgs],
-      app_category     = pkg_to_cat[pkgs],
-      start_time       = starts,
-      Duration         = sample(5:900, n, replace = TRUE) + runif(n),
-      phone_session_id = cumsum(c(0, as.numeric(diff(starts)) > 300)) %% 100
-    )
-  }
-) |> arrange(participant_code, start_time)
-# --- end synthetic sample ---
+df_raw <- read_csv(
+  "~/Downloads/d_apps_anonymized.csv",
+  col_types = cols(
+    participant_code = col_character(),
+    start_time       = col_datetime(),
+    end_time         = col_datetime(),
+    duration         = col_double(),
+    phone_session_id = col_double(),
+    app_session_id   = col_double(),
+    package_name     = col_character(),
+    app_name         = col_character(),
+    category         = col_character(),
+    .default         = col_skip()
+  )
+) |>
+  rename(app_category = category, Duration = duration) |>
+  mutate(
+    app_name     = str_squish(app_name),     # removes stray leading/trailing spaces
+    app_category = translate_category(app_category)
+  ) |>
+  arrange(participant_code, start_time)
 ```
 
 ---
@@ -118,28 +74,12 @@ df_raw <- map2_dfr(
 ### Merge consecutive same-app episodes
 
 ```{r merge}
-gap_threshold <- 10 * 60
-
-merge_consecutive <- function(d, gap_sec) {
-  d <- arrange(d, start_time)
-  out <- list(); cur <- d[1, ]
-  for (i in seq_len(nrow(d))[-1]) {
-    row <- d[i, ]
-    gap <- as.numeric(row$start_time - (cur$start_time + cur$Duration), units = "secs")
-    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
-      cur$Duration <- cur$Duration + row$Duration
-    } else {
-      out <- c(out, list(cur)); cur <- row
-    }
-  }
-  bind_rows(c(out, list(cur)))
-}
-
 df_merged <- df_raw |>
   filter(Duration > 0) |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
-  ungroup()
+  ungroup() |>
+  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
 ```
 
 ### Build edge list from consecutive app pairs
@@ -153,7 +93,10 @@ edges_app <- df_merged |>
   ungroup() |>
   filter(!is.na(next_app), app_name != next_app) |>   # remove self-loops
   count(from = app_name, to = next_app, name = "weight") |>
-  arrange(desc(weight))
+  arrange(desc(weight)) |>
+  group_by(from) |>
+  mutate(prob = weight / sum(weight)) |>   # P(to | from)
+  ungroup()
 
 # For the category-level network
 edges_cat <- df_merged |>
@@ -163,7 +106,10 @@ edges_cat <- df_merged |>
   ungroup() |>
   filter(!is.na(next_cat), app_category != next_cat) |>
   count(from = app_category, to = next_cat, name = "weight") |>
-  arrange(desc(weight))
+  arrange(desc(weight)) |>
+  group_by(from) |>
+  mutate(prob = weight / sum(weight)) |>
+  ungroup()
 
 cat("App-level edges (unique transitions):", nrow(edges_app), "\n")
 cat("Category-level edges:                ", nrow(edges_cat), "\n")
@@ -179,10 +125,15 @@ head(edges_app, 10) |>
 ### Build graph
 
 ```{r build-graph-app}
-# Node attributes: one row per app with category
+# One row per app: use the most common app_category to avoid duplicate nodes
+# (some apps appear with >1 category due to NA records; distinct() would create
+# orphan nodes that cluster in the layout center with the wrong colour).
 nodes_app <- df_merged |>
-  distinct(app_name, app_category) |>
-  rename(name = app_name)
+  count(app_name, app_category) |>
+  group_by(app_name) |>
+  slice_max(n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(name = app_name, app_category)
 
 g_app <- tbl_graph(
   nodes = nodes_app,
@@ -194,13 +145,17 @@ g_app <- tbl_graph(
     degree_total = centrality_degree(mode = "all"),
     degree_in    = centrality_degree(mode = "in"),
     degree_out   = centrality_degree(mode = "out"),
-    closeness    = centrality_closeness(mode = "all"),
+    closeness    = centrality_closeness(mode = "all", normalized = TRUE),
     betweenness  = centrality_betweenness(directed = TRUE, weights = NULL),
     eigenvector  = centrality_eigen(directed = FALSE)
   )
 
 cat("Nodes:", igraph::vcount(g_app), "| Edges:", igraph::ecount(g_app), "\n")
 cat("Is directed:", igraph::is_directed(g_app), "\n")
+
+n_components <- igraph::components(g_app)$no
+if (n_components > 1)
+  message(sprintf("Graph has %d components — closeness is defined within components only.", n_components))
 ```
 
 ### Centrality summary
@@ -210,11 +165,12 @@ g_app |>
   activate(nodes) |>
   as_tibble() |>
   arrange(desc(degree_total)) |>
+  slice_head(n = 20) |>
   select(app = name, category = app_category,
          degree = degree_total, in_deg = degree_in,
          out_deg = degree_out, betweenness, eigenvector) |>
   mutate(across(where(is.numeric), \(x) round(x, 3))) |>
-  knitr::kable(caption = "Node centrality measures (sorted by degree)")
+  knitr::kable(caption = "Node centrality measures — top 20 apps by degree")
 ```
 
 ```{r centrality-plot, fig.width=9, fig.height=4}
@@ -229,6 +185,7 @@ cat_pal <- c(
 g_app |>
   activate(nodes) |>
   as_tibble() |>
+  slice_max(degree_total, n = 20) |>
   pivot_longer(c(degree_in, degree_out, betweenness, eigenvector),
                names_to = "measure", values_to = "value") |>
   mutate(measure = recode(measure,
@@ -249,38 +206,46 @@ g_app |>
 
 ### Visualisation
 
-```{r network-viz-app, fig.width=10, fig.height=8}
-# Threshold: only draw edges above a minimum weight for legibility
-# DECISION POINT: adjust weight_threshold based on actual data volume
-weight_threshold <- quantile(edges_app$weight, 0.5)
+```{r network-viz-app, fig.width=11, fig.height=9}
+# Keep top-N apps by degree; only draw edges where ≥5% of source transitions
+# go to that destination — keeps the graph readable while showing real patterns.
+top_n_viz    <- 25
+top_apps_viz <- g_app |> activate(nodes) |> as_tibble() |>
+  slice_max(degree_total, n = top_n_viz) |> pull(name)
+
+prob_threshold <- 0.05  # show only transitions that happen ≥5% of the time
 
 g_app |>
+  activate(nodes) |>
+  filter(name %in% top_apps_viz) |>
   activate(edges) |>
-  filter(weight >= weight_threshold) |>
-  ggraph(layout = "fr") +   # Fruchterman-Reingold ≈ ForceAtlas2 in reference
+  filter(prob >= prob_threshold) |>
+  activate(nodes) |>
+  filter(!node_is_isolated()) |>   # drop nodes that have no remaining edges
+  ggraph(layout = "stress") +
   geom_edge_arc(
-    aes(width = weight, alpha = weight),
-    colour    = "grey50",
+    aes(width = prob, alpha = prob),
+    colour    = "grey40",
     arrow     = arrow(length = unit(3, "mm"), type = "closed"),
-    end_cap   = circle(4, "mm"),
-    strength  = 0.15
+    end_cap   = circle(5, "mm"),
+    strength  = 0.2
   ) +
   geom_node_point(
     aes(size = degree_total, colour = app_category),
-    alpha = 0.9
+    alpha = 0.95
   ) +
   geom_node_text(
     aes(label = name),
-    repel = TRUE, size = 3.2, colour = "grey20"
+    repel = TRUE, size = 3.3, colour = "grey10",
+    fontface = "bold", max.overlaps = Inf
   ) +
-  scale_edge_width(range = c(0.3, 3), guide = "none") +
-  scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
-  scale_size(range = c(3, 12), name = "Degree") +
+  scale_edge_width(range = c(0.5, 4), guide = "none") +
+  scale_edge_alpha(range = c(0.3, 0.9), guide = "none") +
+  scale_size(range = c(4, 14), name = "Degree") +
   scale_colour_manual(values = cat_pal, name = "Category",
                       na.value = "#BAB0AC") +
-  labs(title = "App transition network",
-       subtitle = paste0("Edges ≥ ", round(weight_threshold),
-                         " transitions; node size = degree")) +
+  labs(title = paste0("App transition network — top-", top_n_viz, " apps by degree"),
+       subtitle = "Edges shown only where P(to | from) ≥ 5%; width = transition probability; see category network below") +
   theme_graph(base_family = "sans") +
   theme(legend.position = "right")
 ```
@@ -288,14 +253,8 @@ g_app |>
 ### Community detection
 
 ```{r communities-app}
-# Convert to undirected for modularity-based community detection
-# (Louvain works on undirected; for directed use cluster_walktrap)
-g_undirected <- g_app |>
-  activate(edges) |>
-  mutate(weight = weight) |>
-  convert(to_undirected)
-
-communities <- cluster_louvain(g_undirected, weights = E(g_undirected)$weight)
+# Walktrap works directly on the directed graph, preserving A→B ≠ B→A asymmetry
+communities <- cluster_walktrap(g_app, weights = E(g_app)$prob)
 
 cat(sprintf(
   "Communities detected: %d  |  Modularity: %.3f\n",
@@ -315,25 +274,30 @@ g_app |>
   knitr::kable(caption = "Community membership per app")
 ```
 
-```{r community-viz, fig.width=10, fig.height=8}
+```{r community-viz, fig.width=11, fig.height=9}
 g_app |>
+  activate(nodes) |>
+  filter(name %in% top_apps_viz) |>
   activate(edges) |>
-  filter(weight >= weight_threshold) |>
-  ggraph(layout = "fr") +
+  filter(prob >= prob_threshold) |>
+  activate(nodes) |>
+  filter(!node_is_isolated()) |>
+  ggraph(layout = "stress") +
   geom_edge_arc(
-    aes(width = weight, alpha = weight),
-    colour   = "grey60",
+    aes(width = prob, alpha = prob),
+    colour   = "grey40",
     arrow    = arrow(length = unit(3, "mm"), type = "closed"),
-    end_cap  = circle(4, "mm"),
-    strength = 0.15
+    end_cap  = circle(5, "mm"),
+    strength = 0.2
   ) +
-  geom_node_point(aes(size = degree_total, colour = community), alpha = 0.9) +
-  geom_node_text(aes(label = name), repel = TRUE, size = 3.2) +
+  geom_node_point(aes(size = degree_total, colour = community), alpha = 0.95) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.3,
+                 fontface = "bold", max.overlaps = Inf) +
   scale_edge_width(range = c(0.3, 3), guide = "none") +
   scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
   scale_size(range = c(3, 12), name = "Degree") +
   scale_colour_brewer(palette = "Set2", name = "Community") +
-  labs(title = "App transition network — community structure") +
+  labs(title = paste0("App transition network — community structure (top-", top_n_viz, " apps)")) +
   theme_graph(base_family = "sans") +
   theme(legend.position = "right")
 ```
@@ -352,31 +316,25 @@ g_cat <- tbl_graph(nodes = nodes_cat, edges = edges_cat, directed = TRUE) |>
   activate(nodes) |>
   mutate(
     degree_total = centrality_degree(mode = "all"),
-    strength_in  = centrality_degree(mode = "in",  weights = E(.)$weight),
-    strength_out = centrality_degree(mode = "out", weights = E(.)$weight)
+    strength_in  = centrality_degree(mode = "in"),
+    strength_out = centrality_degree(mode = "out")
   )
 ```
 
 ```{r category-network-viz, fig.width=7, fig.height=6}
-# Normalise edge weights to proportions for the chord-diagram feel
-total_transitions <- sum(edges_cat$weight)
-
 g_cat |>
   ggraph(layout = "circle") +
   geom_edge_arc(
-    aes(width = weight / total_transitions * 100,
-        alpha = weight,
-        colour = from),
+    aes(width = prob * 100, alpha = prob),
+    colour   = "grey50",
     arrow    = arrow(length = unit(4, "mm"), type = "closed"),
     end_cap  = circle(6, "mm"),
     strength = 0.3
   ) +
-  geom_node_point(aes(colour = name, size = degree_total)) +
+  geom_node_point(aes(size = degree_total), colour = "#4E79A7") +
   geom_node_text(aes(label = name), vjust = -1.2, size = 4, fontface = "bold") +
-  scale_edge_width(range = c(0.5, 5), name = "% of transitions") +
+  scale_edge_width(range = c(0.5, 5), name = "P(to|from) %") +
   scale_edge_alpha(range = c(0.3, 0.9), guide = "none") +
-  scale_edge_colour_manual(values = cat_pal, guide = "none") +
-  scale_colour_manual(values = cat_pal, name = "Category") +
   scale_size(range = c(5, 15), name = "Degree") +
   labs(title = "Category-level transition network") +
   theme_graph(base_family = "sans") +
@@ -405,14 +363,26 @@ edges) gives a cleaner view of app-switching within a single phone pickup,
 uncontaminated by the natural break between sessions.
 
 ```{r within-session-network}
+# Sort chronologically (not by phone_session_id, which can be non-monotonic) and
+# keep only transitions where consecutive rows share the same session ID.
 edges_session <- df_merged |>
-  arrange(participant_code, phone_session_id, start_time) |>
-  group_by(participant_code, phone_session_id) |>
-  mutate(next_app = lead(app_name)) |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  mutate(
+    next_app        = lead(app_name),
+    next_session_id = lead(phone_session_id)
+  ) |>
   ungroup() |>
-  filter(!is.na(next_app), app_name != next_app) |>
+  filter(
+    !is.na(next_app),
+    app_name != next_app,
+    phone_session_id == next_session_id  # within-session only
+  ) |>
   count(from = app_name, to = next_app, name = "weight") |>
-  arrange(desc(weight))
+  arrange(desc(weight)) |>
+  group_by(from) |>
+  mutate(prob = weight / sum(weight)) |>
+  ungroup()
 
 cat("Within-session transitions:\n")
 head(edges_session, 10) |> knitr::kable()

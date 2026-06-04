@@ -19,6 +19,7 @@ library(TraMineRextras)
 library(colorspace)
 library(cluster)
 library(patchwork)
+source("utils.R")
 ```
 
 ## Data
@@ -41,9 +42,15 @@ Relevant columns (full codebook in `Readme.txt`):
 > **Timestamp note:** `seen_timestamp` and `end_timestamp` are epoch/UNIX with
 > a ~2 h offset (CEST summer time). Always use `start_time` / `end_time`.
 
-> **Scale note:** 20M rows makes full-sample TraMineR infeasible (OM distance
-> is O(n²) in persons). The pipeline below samples to a manageable subset for
-> clustering; run descriptives on the full data first.
+> **Unit of analysis:** one sequence per **person-day** — all merged app episodes
+> for one participant on one calendar day. This keeps sequences short (bounded
+> by waking hours) and positions time-comparable across persons. OM distance
+> is then between days, not persons; person-level patterns emerge from the
+> cluster distribution across each participant's days.
+>
+> **Scale note:** with the full dataset (~1000 persons × 46 days ≈ 46 000
+> sequences) OM is still O(n²) in sequences. Sample to ≤ 500 sequences for
+> clustering; run descriptives on the full set first.
 
 ### App categorisation
 
@@ -53,82 +60,24 @@ Extend the lookup table below once the actual package names are known.
 ### Load data
 
 ```{r load-data}
-# --- Real data (uncomment when available) ---
-# app_category comes from a project-provided lookup file (package_name → app_category)
-# app_categories <- read_csv("data/raw/app_categories.csv")  # provided by project
-#
-# df_raw <- read_csv(
-#   "data/raw/uni_mainz_app_session.csv",
-#   col_types = cols(
-#     participant_code = col_character(),
-#     start_time       = col_datetime(),
-#     end_time         = col_datetime(),
-#     Duration         = col_double(),
-#     phone_session_id = col_double(),
-#     app_session_id   = col_double(),
-#     package_name     = col_character(),
-#     app_name         = col_character(),
-#     .default         = col_skip()      # skip id, user_id, seen_timestamp, etc.
-#   )
-# ) |>
-#   left_join(app_categories, by = "package_name") |>
-#   arrange(participant_code, start_time)
-
-# --- SYNTHETIC SAMPLE for development ---
-set.seed(42)
-
-pkg_to_app <- c(
-  "com.instagram.android"         = "Instagram",
-  "com.whatsapp"                  = "WhatsApp",
-  "com.zhiliaoapp.musically"      = "TikTok",
-  "com.google.android.youtube"    = "YouTube",
-  "com.android.chrome"            = "Chrome",
-  "com.google.android.apps.maps"  = "Maps",
-  "com.google.android.calculator" = "Rechner",
-  "com.google.android.gm"         = "Gmail",
-  "com.facebook.orca"             = "Messenger",
-  "com.spotify.music"             = "Spotify"
-)
-pkg_to_cat <- c(
-  "com.instagram.android"         = "social network",
-  "com.whatsapp"                  = "communication",
-  "com.zhiliaoapp.musically"      = "social network",
-  "com.google.android.youtube"    = "social network",
-  "com.android.chrome"            = "tools",
-  "com.google.android.apps.maps"  = "tools",
-  "com.google.android.calculator" = "tools",
-  "com.google.android.gm"         = "communication",
-  "com.facebook.orca"             = "communication",
-  "com.spotify.music"             = "entertainment"
-)
-pkg_names <- names(pkg_to_app)
-pkg_probs  <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
-
-n_persons <- 50
-events_per <- sample(80:400, n_persons, replace = TRUE)
-
-df_raw <- map2_dfr(
-  paste0("P", sprintf("%03d", seq_len(n_persons))),
-  events_per,
-  function(pid, n) {
-    starts <- as.POSIXct("2024-04-01 08:00:00") +
-      cumsum(c(0, sample(5:1800, n - 1, replace = TRUE)))
-    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
-    durs <- sample(5:900, n, replace = TRUE) + runif(n)
-    tibble(
-      participant_code = pid,
-      package_name     = pkgs,
-      app_name         = pkg_to_app[pkgs],
-      app_category     = pkg_to_cat[pkgs],
-      start_time       = starts,
-      end_time         = starts + durs,
-      Duration         = durs,
-      phone_session_id = cumsum(c(0, as.numeric(diff(starts)) > 300)) %% 100,
-      app_session_id   = ifelse(pkgs == "com.whatsapp", NA_real_, seq_along(pkgs))
-    )
-  }
-) |> arrange(participant_code, start_time)
-# --- end synthetic sample ---
+df_raw <- read_csv(
+  "../d_apps_two_participants.csv",
+  col_types = cols(
+    participant_code = col_character(),
+    start_time       = col_datetime(),
+    end_time         = col_datetime(),
+    duration         = col_double(),
+    phone_session_id = col_double(),
+    app_session_id   = col_double(),
+    package_name     = col_character(),
+    app_name         = col_character(),
+    category         = col_character(),
+    .default         = col_skip()
+  )
+) |>
+  rename(app_category = category, Duration = duration) |>
+  mutate(app_category = translate_category(app_category)) |>
+  arrange(participant_code, start_time)
 ```
 
 ---
@@ -173,8 +122,6 @@ df <- df_raw |>
     !is.na(start_time),
     Duration > 0      # drop zero-duration artefacts
   ) |>
-  # Use Duration directly; convert to seconds if needed elsewhere
-  mutate(duration_sec = Duration) |>
   arrange(participant_code, start_time)
 ```
 
@@ -185,115 +132,112 @@ are collapsed. This follows the 10-minute rule in Fan et al. (2026).
 Because `Duration` is pre-computed, we sum durations rather than re-derive.
 
 ```{r merge-episodes}
-gap_threshold <- 10 * 60  # seconds — DECISION POINT: inspect gaps in real data
-
-merge_consecutive <- function(d, gap_sec) {
-  d <- arrange(d, start_time)
-  out  <- list()
-  cur  <- d[1, ]
-  for (i in seq_len(nrow(d))[-1]) {
-    row <- d[i, ]
-    gap <- as.numeric(row$start_time - cur$end_time, units = "secs")
-    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
-      cur$end_time     <- row$end_time
-      cur$duration_sec <- cur$duration_sec + row$duration_sec
-    } else {
-      out <- c(out, list(cur))
-      cur <- row
-    }
-  }
-  bind_rows(c(out, list(cur)))
-}
-
 df_merged <- df |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
-  ungroup()
+  ungroup() |>
+  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
 ```
 
-### Step 4 — Sequence length distribution
+### Step 4 — Person-day sequence length distribution
 
-Inspect before deciding how many persons / how long sequences to use for TraMineR.
+Each person-day is one sequence. Inspect lengths to choose `min_len` and `max_len`.
 
 ```{r seq-lengths}
 seq_len_dist <- df_merged |>
-  count(participant_code, name = "seq_length")
+  mutate(date = as.Date(start_time)) |>
+  count(participant_code, date, name = "seq_length")
 
 seq_len_dist |>
   summarise(
-    n_persons = n(),
-    min = min(seq_length), q25 = quantile(seq_length, .25),
-    median = median(seq_length), q75 = quantile(seq_length, .75),
-    max = max(seq_length)
+    n_person_days = n(),
+    n_persons     = n_distinct(participant_code),
+    min    = min(seq_length),
+    q25    = quantile(seq_length, .25),
+    median = median(seq_length),
+    q75    = quantile(seq_length, .75),
+    max    = max(seq_length)
   ) |>
-  knitr::kable(caption = "Sequence lengths (turns per person, after merging)")
+  knitr::kable(caption = "Events per person-day (after merging)")
 
-# CCDF plot
-seq_len_sorted <- sort(seq_len_dist$seq_length)
-tibble(
-  length = seq_len_sorted,
-  ccdf   = 1 - seq_along(seq_len_sorted) / length(seq_len_sorted)
-) |>
-  ggplot(aes(length, ccdf)) +
-  geom_line() +
-  scale_x_log10() + scale_y_log10() +
-  labs(x = "Sequence length (turns)", y = "CCDF",
-       title = "CCDF of per-person sequence lengths") +
+seq_len_dist |>
+  ggplot(aes(seq_length)) +
+  geom_histogram(bins = 30, fill = "#4E79A7", colour = "white") +
+  facet_wrap(~participant_code, labeller = label_both) +
+  labs(x = "Events per day", y = "Days",
+       title = "Distribution of daily sequence lengths per person") +
   theme_minimal()
 ```
 
-### Step 5 — Filter to IQR and sample for TraMineR
+### Step 5 — Filter and sample person-days for TraMineR
 
-TraMineR's OM distance is O(n²) in persons and O(L²) in sequence length.
-For ~20M rows, work on a sample; run descriptive analyses on the full data.
+Drop very short days (too little information) and cap very long ones.
+At scale, sample up to `max_seq_traminer` person-days for OM clustering.
 
 ```{r filter-sample}
-# Keep persons with sequence lengths in IQR (mirrors reference study)
-q25 <- quantile(seq_len_dist$seq_length, .25)
-q75 <- quantile(seq_len_dist$seq_length, .75)
+min_len <- 5   # minimum merged events per day
+max_len <- 50  # cap: sequences truncated to this length
 
-eligible <- seq_len_dist |>
-  filter(seq_length >= q25, seq_length <= q75) |>
-  pull(participant_code)
+valid_days <- seq_len_dist |> filter(seq_length >= min_len)
 
-# DECISION POINT: TraMineR is feasible up to ~300-500 persons.
-# Sample down if more eligible persons exist.
-max_persons_traminer <- 300
-sampled_persons <- if (length(eligible) > max_persons_traminer) {
-  set.seed(1)
-  sample(eligible, max_persons_traminer)
+max_seq_traminer <- 500  # OM is O(n²); keep ≤ 500 for feasibility
+set.seed(1)
+sampled_days <- if (nrow(valid_days) > max_seq_traminer) {
+  slice_sample(valid_days, n = max_seq_traminer)
 } else {
-  eligible
+  valid_days
 }
 
 df_filtered <- df_merged |>
-  filter(participant_code %in% sampled_persons) |>
-  group_by(participant_code) |>
+  mutate(date = as.Date(start_time)) |>
+  inner_join(sampled_days |> select(participant_code, date),
+             by = c("participant_code", "date")) |>
+  group_by(participant_code, date) |>
   mutate(turn = row_number()) |>
+  filter(turn <= max_len) |>
   ungroup()
 
 cat(sprintf(
-  "Using %d persons, sequence lengths %d–%d turns\n",
-  length(sampled_persons), q25, q75
+  "%d person-days retained across %d persons; sequences capped at %d turns\n",
+  nrow(sampled_days), n_distinct(sampled_days$participant_code), max_len
+))
+
+# Reduce alphabet: collapse apps with fewer than min_app_obs episodes across all
+# person-days into "(other app)". This keeps the legend and seqIplot readable.
+min_app_obs <- 10  # DECISION POINT — lower = more detail, higher = cleaner plots
+app_episode_counts <- table(df_filtered$app_name)
+frequent_apps <- names(app_episode_counts)[app_episode_counts >= min_app_obs]
+
+df_filtered <- df_filtered |>
+  mutate(app_name = if_else(app_name %in% frequent_apps, app_name, "(other app)"))
+
+cat(sprintf(
+  "Alphabet: %d frequent apps kept; %d rare apps collapsed into '(other app)'\n",
+  length(frequent_apps), sum(app_episode_counts < min_app_obs)
 ))
 ```
 
 ### Step 6 — Reshape to wide format
 
-```{r wide-format}
-max_turn <- max(df_filtered$turn)
+One row per person-day. Columns t1 … t`max_len` are the app sequence for that day.
 
-# App-level wide matrix
+```{r wide-format}
+max_turn <- max_len  # already filtered in step 5
+
+# App-level wide matrix (rows = person-days)
 df_wide_app <- df_filtered |>
-  select(participant_code, turn, app_name) |>
+  select(participant_code, date, turn, app_name) |>
   pivot_wider(names_from = turn, values_from = app_name, names_prefix = "t") |>
-  select(participant_code, paste0("t", seq_len(max_turn)))
+  select(participant_code, date, starts_with("t"))
 
 # Category-level wide matrix
 df_wide_cat <- df_filtered |>
-  select(participant_code, turn, app_category) |>
+  select(participant_code, date, turn, app_category) |>
   pivot_wider(names_from = turn, values_from = app_category, names_prefix = "t") |>
-  select(participant_code, paste0("t", seq_len(max_turn)))
+  select(participant_code, date, starts_with("t"))
+
+cat(sprintf("TraMineR input: %d person-days, sequences up to %d turns\n",
+            nrow(df_wide_app), max_turn))
 ```
 
 ---
@@ -303,7 +247,7 @@ df_wide_cat <- df_filtered |>
 ### Alphabet and colour palette
 
 ```{r alphabet-app}
-app_alphabet <- sort(unique(df_filtered$app_name))
+app_alphabet <- sort(unique(df_filtered$app_name[!is.na(df_filtered$app_name)]))
 n_apps <- length(app_alphabet)
 app_pal <- qualitative_hcl(n_apps, palette = "Dark 3")
 names(app_pal) <- app_alphabet
@@ -327,7 +271,7 @@ cat("App alphabet:\n"); print(app_alphabet)
 
 ```{r seqdef-app}
 app.seq <- seqdef(
-  df_wide_app |> select(-participant_code),
+  df_wide_app |> select(-participant_code, -date),
   alphabet = app_alphabet,
   labels   = app_alphabet,
   cpal     = app_pal[app_alphabet],
@@ -338,23 +282,45 @@ app.seq <- seqdef(
 ### Visualisations
 
 ```{r seqplots-app, fig.width=12, fig.height=8}
-seqIplot(app.seq, sortv = "from.start", with.legend = "right",
-         cex.legend = 0.6, main = "App usage sequences (sampled persons)")
+tryCatch(
+  seqIplot(app.seq, sortv = NULL, with.legend = FALSE,
+           cex.legend = 0.6, main = "App usage sequences (person-days)"),
+  error = function(e) message("seqIplot: ", conditionMessage(e))
+)
 ```
 
 ```{r seqfplot-app, fig.width=10, fig.height=5}
-seqfplot(app.seq, with.legend = "right", border = NA,
-         main = "Most frequent distinct sequences")
+tryCatch(
+  seqfplot(app.seq, with.legend = FALSE, border = NA,
+           main = "Most frequent distinct sequences"),
+  error = function(e) message("seqfplot: ", conditionMessage(e))
+)
 ```
 
 ```{r seqdplot-app, fig.width=10, fig.height=5}
-seqdplot(app.seq, with.legend = "right", border = NA,
-         main = "State distribution over sequence position")
+tryCatch(
+  seqdplot(app.seq, with.legend = FALSE, border = NA,
+           main = "State distribution over sequence position"),
+  error = function(e) message("seqdplot: ", conditionMessage(e))
+)
 ```
 
-```{r seqtrate-app}
-seqtrate(app.seq) |> round(3) |>
-  knitr::kable(caption = "Transition rates between apps")
+```{r seqtrate-cat-inline}
+# App-level seqtrate would produce a 116×116 table — show category-level instead.
+# (Category-level seqtrate is repeated here; the full cat.seq section below has plots.)
+tryCatch({
+  cat_alphabet_tmp <- sort(unique(df_filtered$app_category))
+  df_wide_cat_tmp  <- df_filtered |>
+    select(participant_code, date, turn, app_category) |>
+    pivot_wider(names_from = turn, values_from = app_category, names_prefix = "t") |>
+    select(participant_code, date, starts_with("t"))
+  cat.seq.tmp <- seqdef(
+    df_wide_cat_tmp |> select(-participant_code, -date),
+    alphabet = cat_alphabet_tmp, labels = cat_alphabet_tmp
+  )
+  seqtrate(cat.seq.tmp) |> round(3) |>
+    knitr::kable(caption = "Transition rates between app categories")
+}, error = function(e) message("seqtrate: ", conditionMessage(e)))
 ```
 
 ---
@@ -374,7 +340,7 @@ missing_cats <- setdiff(cat_alphabet, names(cat_pal))
 if (length(missing_cats)) cat_pal[missing_cats] <- gray.colors(length(missing_cats))
 
 cat.seq <- seqdef(
-  df_wide_cat |> select(-participant_code),
+  df_wide_cat |> select(-participant_code, -date),
   alphabet = cat_alphabet,
   labels   = cat_alphabet,
   cpal     = cat_pal[cat_alphabet]
@@ -382,24 +348,28 @@ cat.seq <- seqdef(
 ```
 
 ```{r seqplots-cat, fig.width=12, fig.height=6}
-seqIplot(cat.seq, sortv = "from.start", with.legend = "right",
-         main = "App-category sequences")
-seqdplot(cat.seq, with.legend = "right", border = NA,
-         main = "Category distribution over sequence position")
+tryCatch(
+  seqIplot(cat.seq, sortv = NULL, with.legend = FALSE,
+           main = "App-category sequences"),
+  error = function(e) message("seqIplot cat: ", conditionMessage(e))
+)
+tryCatch(
+  seqdplot(cat.seq, with.legend = FALSE, border = NA,
+           main = "Category distribution over sequence position"),
+  error = function(e) message("seqdplot cat: ", conditionMessage(e))
+)
 ```
 
 ---
 
 ## N-gram motif analysis
 
-Run on the **full merged data** (not just the TraMineR sample) to maximise
+Run on **all merged data** (not just the TraMineR sample) to maximise
 statistical power. Tests bigrams and trigrams against an independence baseline
 with Bonferroni correction (α = 0.001), following Fan et al.
 
 ```{r ngrams}
-# Use full eligible set, not just TraMineR sample
 sequences_full <- df_merged |>
-  filter(participant_code %in% eligible) |>
   arrange(participant_code, start_time) |>
   group_by(participant_code) |>
   summarise(seq = list(app_name), .groups = "drop")
@@ -416,18 +386,46 @@ get_ngrams <- function(seq_list, n) {
 bigrams  <- get_ngrams(sequences_full$seq, 2)
 trigrams <- get_ngrams(sequences_full$seq, 3)
 
-base_freq <- prop.table(table(df_merged$app_name[
-  df_merged$participant_code %in% eligible
-]))
+base_freq <- prop.table(table(df_merged$app_name))
 
-test_ngrams <- function(ngram_vec, base_freq, alpha = 0.001) {
+# Build first-order transition matrix for the correct Markov null hypothesis.
+# Using P(A)×P(B|A) rather than P(A)×P(B) removes autocorrelation from the baseline,
+# so only bigrams that exceed what a Markov process would produce are flagged.
+trans_counts <- df_merged |>
+  arrange(participant_code, start_time) |>
+  group_by(participant_code) |>
+  mutate(next_app = lead(app_name)) |>
+  ungroup() |>
+  filter(!is.na(next_app)) |>
+  count(app_name, next_app)
+
+trans_probs <- trans_counts |>
+  group_by(app_name) |>
+  mutate(p_transition = n / sum(n)) |>
+  ungroup()
+
+test_ngrams <- function(ngram_vec, base_freq, trans_probs, alpha = 0.001) {
   counts     <- sort(table(ngram_vec), decreasing = TRUE)
   total      <- sum(counts)
   bonf_alpha <- alpha / length(counts)
-  bind_rows(lapply(names(counts), function(ng) {
+  result <- bind_rows(lapply(names(counts), function(ng) {
     states <- strsplit(ng, " -> ")[[1]]
     obs_p  <- counts[ng] / total
-    exp_p  <- prod(base_freq[states], na.rm = FALSE)
+    # First-order Markov null: P(A) × P(B|A) for bigrams; chain for trigrams
+    if (length(states) == 2) {
+      p_ba  <- trans_probs |> filter(app_name == states[1], next_app == states[2]) |>
+        pull(p_transition)
+      p_ba  <- if (length(p_ba) == 0) 0 else p_ba
+      exp_p <- base_freq[states[1]] * p_ba
+    } else {
+      p_ba  <- trans_probs |> filter(app_name == states[1], next_app == states[2]) |>
+        pull(p_transition)
+      p_ba  <- if (length(p_ba) == 0) 0 else p_ba
+      p_cb  <- trans_probs |> filter(app_name == states[2], next_app == states[3]) |>
+        pull(p_transition)
+      p_cb  <- if (length(p_cb) == 0) 0 else p_cb
+      exp_p <- base_freq[states[1]] * p_ba * p_cb
+    }
     if (is.na(exp_p) || exp_p == 0) return(NULL)
     sd_p   <- sqrt(exp_p * (1 - exp_p) / total)
     z      <- (obs_p - exp_p) / sd_p
@@ -436,11 +434,16 @@ test_ngrams <- function(ngram_vec, base_freq, alpha = 0.001) {
       tibble(ngram = ng, observed = counts[ng],
              obs_pct = obs_p * 100, exp_pct = exp_p * 100,
              z_score = z, p_value = p)
-  })) |> arrange(desc(z_score))
+  }))
+  if (nrow(result) == 0 || !"z_score" %in% names(result))
+    return(tibble(ngram = character(), observed = integer(),
+                  obs_pct = numeric(), exp_pct = numeric(),
+                  z_score = numeric(), p_value = numeric()))
+  result |> arrange(desc(z_score))
 }
 
-bigram_sig  <- test_ngrams(bigrams,  base_freq)
-trigram_sig <- test_ngrams(trigrams, base_freq)
+bigram_sig  <- test_ngrams(bigrams,  base_freq, trans_probs)
+trigram_sig <- test_ngrams(trigrams, base_freq, trans_probs)
 
 knitr::kable(head(bigram_sig,  10), digits = 3,
              caption = "Top over-represented bigrams (Bonferroni p < 0.001)")
@@ -456,10 +459,10 @@ knitr::kable(head(trigram_sig, 10), digits = 3,
 ## Optimal matching distance & clustering
 
 ```{r om-distance}
-costmatrix <- seqsubm(app.seq, method = "CONSTANT", cval = 2, with.missing = TRUE)
+costmatrix <- seqsubm(app.seq, method = "TRATE", with.missing = TRUE)
 
-# SCALE NOTE: slow for > 300 persons. Cache the result.
-dist_om_path <- "results/tables/dist_om_app.rds"
+# SCALE NOTE: slow for > 500 sequences. Cache the result.
+dist_om_path <- "results/tables/dist_om_personday.rds"
 if (file.exists(dist_om_path)) {
   dist_om <- readRDS(dist_om_path)
 } else {
@@ -470,44 +473,136 @@ if (file.exists(dist_om_path)) {
 ```
 
 ```{r clustering}
-clust_ward <- agnes(dist_om, diss = TRUE, method = "ward")
-plot(clust_ward, which.plot = 2, main = "Dendrogram — app sequences")
+n_seq <- nrow(dist_om)
+if (n_seq >= 3) {
+  clust_ward <- agnes(dist_om, diss = TRUE, method = "ward")
+  plot(clust_ward, which.plot = 2, main = "Dendrogram — app sequences")
+} else {
+  message("Fewer than 3 sequences — skipping clustering (needs full dataset)")
+  clust_ward <- NULL
+}
 ```
 
 ```{r silhouette, fig.width=7, fig.height=4}
-k_range    <- 2:8
-sil_widths <- sapply(k_range, \(k) mean(silhouette(cutree(clust_ward, k), dist_om)[, 3]))
-
-tibble(k = k_range, avg_silhouette = sil_widths) |>
-  ggplot(aes(k, avg_silhouette)) +
-  geom_line() + geom_point() +
-  labs(title = "Average silhouette width by k",
-       x = "Number of clusters", y = "Avg silhouette") +
-  theme_minimal()
+if (!is.null(clust_ward)) {
+  k_range    <- 2:min(8, n_seq - 1)
+  sil_widths <- sapply(k_range, \(k) mean(silhouette(cutree(clust_ward, k), dist_om)[, 3]))
+  tibble(k = k_range, avg_silhouette = sil_widths) |>
+    ggplot(aes(k, avg_silhouette)) +
+    geom_line() + geom_point() +
+    labs(title = "Average silhouette width by k",
+         x = "Number of clusters", y = "Avg silhouette") +
+    theme_minimal()
+}
 ```
 
 ```{r cluster-viz, fig.width=12, fig.height=8}
-k_chosen <- 3  # DECISION POINT: update after inspecting silhouette above
-clusters  <- cutree(clust_ward, k = k_chosen)
-
-seqIplot(app.seq, group = clusters, sortv = "from.start",
-         with.legend = "right", cex.legend = 0.6,
-         main = paste0("Clusters (k = ", k_chosen, ")"))
+if (!is.null(clust_ward)) {
+  k_chosen <- k_range[which.max(sil_widths)]
+  clusters  <- cutree(clust_ward, k = k_chosen)
+  tryCatch(
+    seqIplot(app.seq, group = clusters, sortv = NULL,
+             with.legend = FALSE, cex.legend = 0.6,
+             main = paste0("Clusters (k = ", k_chosen, ")")),
+    error = function(e) message("seqIplot clusters: ", conditionMessage(e))
+  )
+} else {
+  clusters <- NULL
+}
 ```
 
 ```{r cluster-sizes}
-tibble(participant_code = sampled_persons, cluster = as.character(clusters)) |>
-  count(cluster) |>
-  knitr::kable(caption = "Persons per cluster")
+if (!is.null(clusters)) {
+  day_clusters <- df_wide_app |>
+    select(participant_code, date) |>
+    mutate(cluster = as.character(clusters))
+
+  day_clusters |>
+    count(cluster) |>
+    knitr::kable(caption = "Person-days per cluster")
+
+  # How are each person's days distributed across cluster types?
+  day_clusters |>
+    count(participant_code, cluster) |>
+    group_by(participant_code) |>
+    mutate(pct = round(100 * n / sum(n), 1)) |>
+    ungroup() |>
+    select(participant_code, cluster, days = n, pct) |>
+    arrange(participant_code, cluster) |>
+    knitr::kable(caption = "Cluster distribution per person (% of their days)")
+}
 ```
 
 ---
 
-## Phone-session-level analysis
+## Optimal matching distance & clustering — category level
 
-`phone_session_id` increments each time the phone is unlocked. Analysing
-*within-session* sequences answers a different question: given a single
-phone pickup, in what order are apps used?
+Category-level sequences (5 states) produce more readable sequence plots and
+more interpretable cluster labels than app-level sequences. This section
+repeats the OM → clustering pipeline on `cat.seq`.
+
+```{r om-distance-cat}
+dist_om_cat_path <- "results/tables/dist_om_cat.rds"
+if (file.exists(dist_om_cat_path)) {
+  dist_om_cat <- readRDS(dist_om_cat_path)
+} else {
+  costmatrix_cat <- seqsubm(cat.seq, method = "TRATE", with.missing = TRUE)
+  dist_om_cat    <- seqdist(cat.seq, method = "OM", indel = 1,
+                            sm = costmatrix_cat, with.missing = TRUE)
+  saveRDS(dist_om_cat, dist_om_cat_path)
+}
+```
+
+```{r clustering-cat}
+n_seq_cat <- nrow(dist_om_cat)
+if (n_seq_cat >= 3) {
+  clust_ward_cat <- agnes(dist_om_cat, diss = TRUE, method = "ward")
+  plot(clust_ward_cat, which.plot = 2, main = "Dendrogram — category sequences")
+} else {
+  message("Fewer than 3 sequences — skipping category clustering")
+  clust_ward_cat <- NULL
+}
+```
+
+```{r silhouette-cat, fig.width=7, fig.height=4}
+if (!is.null(clust_ward_cat)) {
+  k_range_cat    <- 2:min(8, n_seq_cat - 1)
+  sil_widths_cat <- sapply(k_range_cat,
+    \(k) mean(silhouette(cutree(clust_ward_cat, k), dist_om_cat)[, 3]))
+  tibble(k = k_range_cat, avg_silhouette = sil_widths_cat) |>
+    ggplot(aes(k, avg_silhouette)) +
+    geom_line() + geom_point() +
+    labs(title = "Average silhouette width by k (category sequences)",
+         x = "Number of clusters", y = "Avg silhouette") +
+    theme_minimal()
+}
+```
+
+```{r cluster-viz-cat, fig.width=12, fig.height=8}
+if (!is.null(clust_ward_cat)) {
+  k_chosen_cat  <- k_range_cat[which.max(sil_widths_cat)]
+  clusters_cat  <- cutree(clust_ward_cat, k = k_chosen_cat)
+  tryCatch(
+    seqIplot(cat.seq, group = clusters_cat, sortv = NULL,
+             with.legend = TRUE, cex.legend = 0.8,
+             main = paste0("Category clusters (k = ", k_chosen_cat, ")")),
+    error = function(e) message("seqIplot cat clusters: ", conditionMessage(e))
+  )
+}
+```
+
+---
+
+## Phone-session-level analysis (exploratory)
+
+Complementary to the person-day sequences above. A phone session = one unlock
+episode; within-session sequences ask: given a single pickup, in what order
+are apps used? This is a finer-grained unit than person-day.
+
+**Caveat:** `phone_session_id` is not well-documented (README marks it "xxx").
+The IDs show non-monotonic patterns in the data and appear to reset irregularly.
+Use for grouping only — do not treat the ID values as ordinal or as a reliable
+timeline. Verify with the data provider before publishing session-level results.
 
 ```{r session-analysis}
 # Sequence = apps used within one phone session (one unlock episode)

@@ -23,6 +23,7 @@ library(scales)
 library(patchwork)
 library(ggrepel)
 library(RColorBrewer)
+source("utils.R")
 ```
 
 ## Conceptual framing
@@ -52,57 +53,24 @@ Two models:
 ## Data
 
 ```{r load-data}
-# --- Real data (uncomment when available) ---
-# app_categories <- read_csv("data/raw/app_categories.csv")
-# df_raw <- read_csv(
-#   "data/raw/uni_mainz_app_session.csv",
-#   col_types = cols(
-#     participant_code = col_character(),
-#     start_time       = col_datetime(),
-#     Duration         = col_double(),
-#     package_name     = col_character(),
-#     app_name         = col_character(),
-#     .default         = col_skip()
-#   )
-# ) |>
-#   left_join(app_categories, by = "package_name") |>
-#   arrange(participant_code, start_time)
-
-# --- SYNTHETIC SAMPLE ---
-set.seed(42)
-pkg_to_app <- c(
-  "com.instagram.android" = "Instagram", "com.whatsapp" = "WhatsApp",
-  "com.zhiliaoapp.musically" = "TikTok", "com.google.android.youtube" = "YouTube",
-  "com.android.chrome" = "Chrome", "com.google.android.apps.maps" = "Maps",
-  "com.google.android.calculator" = "Rechner", "com.google.android.gm" = "Gmail",
-  "com.facebook.orca" = "Messenger", "com.spotify.music" = "Spotify"
-)
-pkg_to_cat <- c(
-  "com.instagram.android" = "social network", "com.whatsapp" = "communication",
-  "com.zhiliaoapp.musically" = "social network", "com.google.android.youtube" = "social network",
-  "com.android.chrome" = "tools", "com.google.android.apps.maps" = "tools",
-  "com.google.android.calculator" = "tools", "com.google.android.gm" = "communication",
-  "com.facebook.orca" = "communication", "com.spotify.music" = "entertainment"
-)
-pkg_names <- names(pkg_to_app); pkg_probs <- c(3, 3, 2, 2, 1, 1, .5, 1, 1, 1)
-
-df_raw <- map2_dfr(
-  paste0("P", sprintf("%03d", 1:200)),
-  sample(100:600, 200, replace = TRUE),
-  function(pid, n) {
-    starts <- as.POSIXct("2024-04-01 08:00:00") +
-      cumsum(c(0, sample(30:3600, n - 1, replace = TRUE)))
-    pkgs <- sample(pkg_names, n, replace = TRUE, prob = pkg_probs)
-    tibble(
-      participant_code = pid,
-      package_name = pkgs, app_name = pkg_to_app[pkgs],
-      app_category = pkg_to_cat[pkgs],
-      start_time = starts,
-      Duration = sample(10:900, n, replace = TRUE) + runif(n)
-    )
-  }
-) |> arrange(participant_code, start_time)
-# --- end synthetic sample ---
+df_raw <- read_csv(
+  "../d_apps_two_participants.csv",
+  col_types = cols(
+    participant_code = col_character(),
+    start_time       = col_datetime(),
+    end_time         = col_datetime(),
+    duration         = col_double(),
+    phone_session_id = col_double(),
+    app_session_id   = col_double(),
+    package_name     = col_character(),
+    app_name         = col_character(),
+    category         = col_character(),
+    .default         = col_skip()
+  )
+) |>
+  rename(app_category = category, Duration = duration) |>
+  mutate(app_category = translate_category(app_category)) |>
+  arrange(participant_code, start_time)
 ```
 
 ---
@@ -112,25 +80,12 @@ df_raw <- map2_dfr(
 ### Merge consecutive same-app episodes
 
 ```{r merge}
-gap_threshold <- 10 * 60
-
-merge_consecutive <- function(d, gap_sec) {
-  d <- arrange(d, start_time); out <- list(); cur <- d[1, ]
-  for (i in seq_len(nrow(d))[-1]) {
-    row <- d[i, ]
-    gap <- as.numeric(row$start_time - (cur$start_time + cur$Duration), units = "secs")
-    if (row$app_name == cur$app_name && !is.na(gap) && gap <= gap_sec) {
-      cur$Duration <- cur$Duration + row$Duration
-    } else { out <- c(out, list(cur)); cur <- row }
-  }
-  bind_rows(c(out, list(cur)))
-}
-
 df_merged <- df_raw |>
   filter(Duration > 0) |>
   group_by(participant_code) |>
   group_modify(~ merge_consecutive(.x, gap_threshold)) |>
-  ungroup()
+  ungroup() |>
+  filter(!app_name %in% noise_apps)  # remove launcher/home-screen artefacts (see utils.R)
 ```
 
 ### Create enriched tokens
@@ -144,10 +99,10 @@ df_tokens <- df_merged |>
   mutate(
     hour = as.integer(format(start_time, "%H")),
     time_of_day = case_when(
-      hour >= 6  & hour < 12 ~ "morning",
-      hour >= 12 & hour < 17 ~ "afternoon",
-      hour >= 17 & hour < 22 ~ "evening",
-      TRUE                   ~ "night"
+      hour >= 6  & hour < 12 ~ "morning",    # 06–12
+      hour >= 12 & hour < 18 ~ "afternoon",  # 12–18
+      hour >= 18 & hour < 24 ~ "evening",    # 18–24
+      TRUE                   ~ "night"       # 00–06
     ),
     # Base token: just the app name
     token_app  = str_replace_all(app_name, " ", "_"),
@@ -163,24 +118,38 @@ cat("Total events:          ", nrow(df_tokens), "\n")
 ### Build per-person sequences
 
 ```{r sequences}
-# Base: one character vector of app tokens per person
+# Base: one character vector of app tokens per person (for Word2Vec corpus)
 seqs_app <- df_tokens |>
   arrange(participant_code, start_time) |>
   group_by(participant_code) |>
   summarise(tokens = list(token_app), .groups = "drop")
 
-# Enriched: app + time-of-day
+# Enriched: app + time-of-day (for Word2Vec corpus)
 seqs_rich <- df_tokens |>
   arrange(participant_code, start_time) |>
   group_by(participant_code) |>
   summarise(tokens = list(token_rich), .groups = "drop")
 
-# Word2Vec needs sequences as a flat character vector (sentences = " "-separated)
+# Word2Vec corpus: flat character vectors per person
 corpus_app  <- sapply(seqs_app$tokens,  paste, collapse = " ")
 corpus_rich <- sapply(seqs_rich$tokens, paste, collapse = " ")
 
+# Per-day documents for Doc2Vec: one document per person-day, then average
+# to get a person embedding. Very long per-person documents regress toward
+# the corpus mean; per-day units give the model more varied training signal.
+seqs_rich_day <- df_tokens |>
+  arrange(participant_code, start_time) |>
+  mutate(date = as.Date(start_time)) |>
+  group_by(participant_code, date) |>
+  summarise(
+    doc_id = paste0(first(participant_code), "_", first(date)),
+    text   = paste(token_rich, collapse = " "),
+    .groups = "drop"
+  )
+
 cat("Corpus size (persons):", length(corpus_app), "\n")
 cat("Median sequence length:", median(lengths(seqs_app$tokens)), "tokens\n")
+cat("Per-day documents:", nrow(seqs_rich_day), "\n")
 ```
 
 ---
@@ -189,7 +158,7 @@ cat("Median sequence length:", median(lengths(seqs_app$tokens)), "tokens\n")
 
 ### Train model
 
-```{r train-w2v, cache=TRUE}
+```{r train-w2v}
 # DECISION POINT: dim, window, min_count, iter
 # - dim: 50 sufficient for small vocabularies; use 100+ for large ones
 # - window: 5 matches the reference; smaller = more local context
@@ -198,9 +167,19 @@ cat("Median sequence length:", median(lengths(seqs_app$tokens)), "tokens\n")
 
 w2v_path <- "results/tables/w2v_model.bin"
 
+w2v <- NULL
 if (file.exists(w2v_path)) {
   w2v <- read.word2vec(w2v_path)
-} else {
+  # Validate: cached vocabulary should be a subset of current tokens (allow extras from
+  # min_count filtering, but a much larger vocab signals a stale model from other data).
+  cached_vocab    <- summary(w2v, type = "vocabulary")
+  expected_tokens <- unique(unlist(seqs_rich$tokens))
+  if (length(cached_vocab) > length(expected_tokens) * 3) {
+    message("Stale Word2Vec cache (vocabulary much larger than current data) — retraining.")
+    w2v <- NULL
+  }
+}
+if (is.null(w2v)) {
   set.seed(42)
   w2v <- word2vec(
     x         = corpus_rich,
@@ -247,14 +226,14 @@ map_dfr(query_tokens, find_similar, model = w2v) |>
 emb_mat <- as.matrix(w2v)
 
 # Parse token back into app name and time-of-day
+app_cat_lookup <- df_merged |> distinct(app_name, app_category) |> deframe()
+
 emb_df <- as_tibble(emb_mat, rownames = "token") |>
   mutate(
     parts       = str_split(token, "_(?=morning|afternoon|evening|night)"),
     app_name    = map_chr(parts, 1),
     time_of_day = map_chr(parts, \(p) if (length(p) > 1) p[2] else "unknown"),
-    app_category = pkg_to_cat[
-      names(pkg_to_app)[match(app_name, pkg_to_app)]
-    ]
+    app_category = app_cat_lookup[app_name]
   ) |>
   select(-parts)
 ```
@@ -267,7 +246,7 @@ if (nrow(emb_mat) > 15) {
   tsne_out <- Rtsne(
     emb_mat,
     dims       = 2,
-    perplexity = min(5, floor((nrow(emb_mat) - 1) / 3)),
+    perplexity = min(30, floor((nrow(emb_mat) - 1) / 3)),
     verbose    = FALSE,
     max_iter   = 1000
   )
@@ -316,17 +295,21 @@ into meaningful behavioural types?
 
 ### Train model
 
-```{r train-d2v, cache=TRUE}
+```{r train-d2v}
 d2v_path <- "results/tables/d2v_model.bin"
 
+d2v <- NULL
 if (file.exists(d2v_path)) {
   d2v <- read.paragraph2vec(d2v_path)
-} else {
-  # doc2vec expects a data frame with "doc_id" and "text" columns
-  d2v_input <- tibble(
-    doc_id = seqs_rich$participant_code,
-    text   = corpus_rich
-  )
+  # Validate: doc IDs must match current per-day document IDs.
+  cached_doc_ids <- rownames(as.matrix(d2v, which = "docs"))
+  if (!setequal(cached_doc_ids, seqs_rich_day$doc_id)) {
+    message("Stale Doc2Vec cache (doc IDs don't match current per-day documents) — retraining.")
+    d2v <- NULL
+  }
+}
+if (is.null(d2v)) {
+  d2v_input <- seqs_rich_day |> select(doc_id, text)
 
   set.seed(42)
   d2v <- paragraph2vec(
@@ -345,18 +328,25 @@ if (file.exists(d2v_path)) {
 ### Person embeddings: UMAP visualisation
 
 ```{r person-embeddings}
-# Extract document (person) embeddings
-person_emb <- as.matrix(d2v, which = "docs")
-rownames(person_emb) <- seqs_rich$participant_code
+# Average per-day embeddings to get person-level embeddings.
+# Splitting into days gives more varied training signal; averaging recovers
+# the person-level representation for downstream clustering/UMAP.
+person_emb <- as.matrix(d2v, which = "docs") |>
+  as_tibble(rownames = "doc_id") |>
+  mutate(
+    date             = str_extract(doc_id, "\\d{4}-\\d{2}-\\d{2}$"),
+    participant_code = str_remove(doc_id, "_\\d{4}-\\d{2}-\\d{2}$")
+  ) |>
+  group_by(participant_code) |>
+  summarise(across(where(is.numeric), mean), .groups = "drop") |>
+  column_to_rownames("participant_code") |>
+  as.matrix()
 
 cat("Person embedding matrix:", nrow(person_emb), "persons ×",
     ncol(person_emb), "dimensions\n")
 ```
 
 ```{r umap-persons, fig.width=9, fig.height=7}
-set.seed(42)
-umap_out <- umap(person_emb, n_neighbors = min(15, nrow(person_emb) - 1))
-
 # Annotate with person-level usage stats (dominant category, sequence length)
 person_stats <- df_tokens |>
   group_by(participant_code) |>
@@ -368,10 +358,27 @@ person_stats <- df_tokens |>
     .groups = "drop"
   )
 
+set.seed(42)
+umap_out <- tryCatch(
+  umap(person_emb, n_neighbors = min(15, max(2, nrow(person_emb) - 1))),
+  error = function(e) {
+    message("UMAP requires ≥ 3 persons — using PCA fallback: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(umap_out)) {
+  coords <- umap_out$layout
+} else {
+  pca_out <- prcomp(person_emb, scale. = FALSE)
+  coords  <- pca_out$x[, 1:min(2, ncol(pca_out$x)), drop = FALSE]
+  if (ncol(coords) < 2) coords <- cbind(coords, 0)
+}
+
 umap_df <- tibble(
   participant_code = rownames(person_emb),
-  umap1 = umap_out$layout[, 1],
-  umap2 = umap_out$layout[, 2]
+  umap1 = coords[, 1],
+  umap2 = coords[, 2]
 ) |>
   left_join(person_stats, by = "participant_code")
 
@@ -395,41 +402,55 @@ umap_df |>
 
 ```{r person-clusters, fig.width=9, fig.height=7}
 # DECISION POINT: choose k via silhouette (same approach as Method 1)
-k_range <- 2:6
-sil_widths <- sapply(k_range, function(k) {
-  cl  <- kmeans(person_emb, centers = k, nstart = 25, iter.max = 100)
-  sil <- silhouette(cl$cluster, dist(person_emb))
-  mean(sil[, 3])
-})
+# Cap at n_persons - 1; skip clustering when fewer than 3 persons are present.
+n_persons_emb <- nrow(person_emb)
+k_range       <- if (n_persons_emb >= 3) 2:min(6, n_persons_emb - 1) else integer(0)
 
-tibble(k = k_range, avg_silhouette = sil_widths) |>
-  ggplot(aes(k, avg_silhouette)) +
-  geom_line() + geom_point(size = 2) +
-  labs(title = "Person cluster quality by k (k-means on Doc2Vec embeddings)",
-       x = "k", y = "Average silhouette width") +
-  theme_minimal()
+if (length(k_range) > 0) {
+  sil_widths <- sapply(k_range, function(k) {
+    cl  <- kmeans(person_emb, centers = k, nstart = 25, iter.max = 100)
+    sil <- silhouette(cl$cluster, dist(person_emb))
+    mean(sil[, 3])
+  })
+
+  tibble(k = k_range, avg_silhouette = sil_widths) |>
+    ggplot(aes(k, avg_silhouette)) +
+    geom_line() + geom_point(size = 2) +
+    labs(title = "Person cluster quality by k (k-means on Doc2Vec embeddings)",
+         x = "k", y = "Average silhouette width") +
+    theme_minimal()
+} else {
+  sil_widths <- numeric(0)
+  cat(sprintf("Too few persons (%d) for clustering — needs full dataset.\n", n_persons_emb))
+}
 ```
 
 ```{r cluster-umap, fig.width=9, fig.height=7}
-k_chosen <- k_range[which.max(sil_widths)]
-cat("Chosen k:", k_chosen, "\n")
+if (length(k_range) > 0) {
+  k_chosen <- k_range[which.max(sil_widths)]
+  cat("Chosen k:", k_chosen, "\n")
 
-set.seed(42)
-km <- kmeans(person_emb, centers = k_chosen, nstart = 25)
+  set.seed(42)
+  km <- kmeans(person_emb, centers = k_chosen, nstart = 25)
 
-umap_df |>
-  mutate(cluster = factor(km$cluster)) |>
-  ggplot(aes(umap1, umap2, colour = cluster, size = seq_len)) +
-  geom_point(alpha = 0.8) +
-  scale_colour_brewer(palette = "Set2", name = "Cluster") +
-  scale_size(range = c(1.5, 6), name = "Sequence\nlength") +
-  labs(title = paste0("Person clusters in Doc2Vec space (k = ", k_chosen, ")"),
-       x = "UMAP 1", y = "UMAP 2") +
-  theme_minimal()
+  umap_df |>
+    mutate(cluster = factor(km$cluster)) |>
+    ggplot(aes(umap1, umap2, colour = cluster, size = seq_len)) +
+    geom_point(alpha = 0.8) +
+    scale_colour_brewer(palette = "Set2", name = "Cluster") +
+    scale_size(range = c(1.5, 6), name = "Sequence\nlength") +
+    labs(title = paste0("Person clusters in Doc2Vec space (k = ", k_chosen, ")"),
+         x = "UMAP 1", y = "UMAP 2") +
+    theme_minimal()
+} else {
+  km <- NULL
+  cat("Skipping cluster UMAP — not enough persons.\n")
+}
 ```
 
 ```{r cluster-profiles}
 # What characterises each cluster?
+if (!is.null(km)) {
 tibble(
   participant_code = rownames(person_emb),
   cluster = factor(km$cluster)
@@ -445,6 +466,9 @@ tibble(
     .groups = "drop"
   ) |>
   knitr::kable(caption = "Cluster profiles")
+} else {
+  cat("Skipping cluster profiles — not enough persons.\n")
+}
 ```
 
 ---
@@ -481,7 +505,7 @@ if (nrow(traj_emb) >= 4) {
   bg_df <- as_tibble(all_2d, rownames = "token") |>
     mutate(
       app_name = map_chr(str_split(token, "_(?=morning|afternoon|evening|night)"), 1),
-      app_category = pkg_to_cat[names(pkg_to_app)[match(app_name, pkg_to_app)]]
+      app_category = app_cat_lookup[app_name]
     )
 
   # Trajectory data frame: one row per step
