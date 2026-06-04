@@ -64,7 +64,7 @@ Extend the lookup table below once the actual package names are known.
 
 ```{r load-data}
 df_raw <- read_csv(
-  here::here("R/_files/d_apps_anonymized.csv"),
+  "../R/_files/df_sample_5.csv",
   col_types = cols(
     participant_code = col_character(),
     start_time       = col_datetime(),
@@ -633,3 +633,4 @@ session_lengths |>
 # with an unclear range/reset logic. Verify that IDs don't wrap within a person
 # before treating them as globally unique session boundaries.
 ```
+
